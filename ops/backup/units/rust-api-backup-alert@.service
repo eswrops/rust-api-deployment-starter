@@ -1,0 +1,16 @@
+[Unit]
+Description=Visible alert for failed backup unit %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=rustapi
+Group=rustapi
+ExecStart=/usr/local/sbin/rust-api-backup-alert %i
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/rust-api

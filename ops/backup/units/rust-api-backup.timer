@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily rust-api SQLite backup at 04:15 UTC
+
+[Timer]
+OnCalendar=*-*-* 04:15:00 UTC
+RandomizedDelaySec=300
+Persistent=true
+Unit=rust-api-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly rust-api restore drill, Sundays at 05:15 UTC
+
+[Timer]
+OnCalendar=Sun *-*-* 05:15:00 UTC
+RandomizedDelaySec=300
+Persistent=true
+Unit=rust-api-restore-drill.service
+
+[Install]
+WantedBy=timers.target

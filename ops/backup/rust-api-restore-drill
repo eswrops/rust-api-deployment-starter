@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# rust-api-restore-drill: proves the off-site backup restores. Weekly
+# (rust-api-restore-drill.timer, Sunday 05:15 UTC) and after every backup
+# change. Downloads the newest snapshot from the private GCS bucket into a
+# scratch directory, verifies integrity with the Python stdlib sqlite3, then
+# boots the deployed rust-api binary against the restored file on a scratch
+# port (APP_BIND configured explicitly) and requires /health/ready == 200.
+# The verdict is logged and uploaded to drills/ off-site. Non-zero exit
+# triggers the alert unit via OnFailure.
+set -Eeuo pipefail
+
+LIB_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib.sh
+. "$LIB_DIR/rust-api-backup-lib.sh"
+
+ENV_FILE="${BACKUP_ENV_FILE:-/etc/rust-api/backup.env}"
+[ -r "$ENV_FILE" ] || { echo "backup env not readable: $ENV_FILE" >&2; exit 1; }
+set -a
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+set +a
+
+: "${GCS_BUCKET:?GCS_BUCKET must be set}"
+: "${GCS_KEY_FILE:?GCS_KEY_FILE must be set}"
+: "${DRILL_BIN:=/opt/rust-api/current/rust-api}"
+: "${DRILL_PORT:=18081}"
+: "${BACKUP_DIR:=/var/lib/rust-api/backups}"
+
+report="$(mktemp)"
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch" "$report"' EXIT
+chmod 700 "$scratch"
+
+fail_drill() { echo "DRILL FAIL: $*" | tee -a "$report" >&2; exit 1; }
+
+echo "restore drill $(date -u +%Y-%m-%dT%H:%M:%SZ): bucket gs://$GCS_BUCKET" | tee "$report"
+
+# 1. Newest LIVE snapshot from the bucket — the VM-loss path, never a local
+#    file. $2 is timeDeleted: empty means the current live version.
+newest="$(gcs_list "$GCS_KEY_FILE" "$GCS_BUCKET" "snapshots/" |
+  awk -F'|' '$2 == "" && $4 != "" {print $1 "|" $4}' | sort -r | head -1 | cut -d'|' -f2)"
+[ -n "$newest" ] || fail_drill "no snapshot found under snapshots/ in gs://$GCS_BUCKET"
+echo "newest off-site snapshot: $newest" | tee -a "$report"
+
+restored="$scratch/app.db"
+gcs_download "$GCS_KEY_FILE" "$GCS_BUCKET" "$newest" "$restored" ||
+  fail_drill "download of $newest failed"
+chmod 600 "$restored"
+
+# 2. Structural verification without the sqlite3 CLI (python3 stdlib).
+python3 - "$restored" >"$scratch/check.txt" 2>&1 <<'PY' || fail_drill "integrity check failed: $(cat "$scratch/check.txt")"
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
+tables = sorted(r[0] for r in con.execute(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
+migrations = con.execute("SELECT count(*) FROM _sqlx_migrations").fetchone()[0]
+users, posts, likes = (
+    con.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in ("users", "posts", "likes"))
+print(f"integrity_check={integrity} tables={tables} migrations={migrations} users={users} posts={posts} likes={likes}")
+sys.exit(0 if integrity == "ok" else 1)
+PY
+cat "$scratch/check.txt" | tee -a "$report"
+
+# 3. Boot the deployed binary against the restored file (explicit APP_BIND).
+[ -x "$DRILL_BIN" ] || fail_drill "drill binary missing or not executable: $DRILL_BIN"
+DATABASE_URL="sqlite://$restored" APP_BIND="127.0.0.1:$DRILL_PORT" RUST_LOG=warn \
+  "$DRILL_BIN" >"$scratch/app.log" 2>&1 &
+app_pid=$!
+ready="fail"
+for _ in $(seq 1 20); do
+  code="$(curl -s --max-time 2 -o "$scratch/ready.json" -w '%{http_code}' "http://127.0.0.1:$DRILL_PORT/health/ready" 2>/dev/null || true)"
+  if [ "$code" = "200" ]; then ready="ok"; break; fi
+  sleep 0.5
+done
+kill "$app_pid" 2>/dev/null || true
+wait "$app_pid" 2>/dev/null || true
+[ "$ready" = "ok" ] || fail_drill "restored database did not pass /health/ready (log: $(tail -3 "$scratch/app.log" | tr '\n' ' '))"
+echo "staged binary against restored DB: /health/ready -> 200 $(cat "$scratch/ready.json")" | tee -a "$report"
+
+echo "DRILL PASS $(date -u +%Y-%m-%dT%H:%M:%SZ): $newest restored, verified, served" | tee -a "$report"
+mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$newest" >"$BACKUP_DIR/last-drill-success" 2>/dev/null || true
+
+# 4. Off-site drill report (best effort; failure here must not mask the PASS).
+gcs_upload "$GCS_KEY_FILE" "$GCS_BUCKET" \
+  "drills/drill-$(date -u +%Y%m%dT%H%M%SZ).txt" "$report" "text/plain" ||
+  echo "warning: could not upload drill report" >&2
+exit 0

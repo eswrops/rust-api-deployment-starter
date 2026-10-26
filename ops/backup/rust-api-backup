@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# rust-api-backup: online SQLite snapshot + off-site upload to a private GCS
+# bucket, with local and remote retention and a heartbeat object.
+#
+# Runs as the rustapi service account (systemd timer rust-api-backup.timer,
+# daily 04:15 UTC). Configuration comes from /etc/rust-api/backup.env. A
+# non-zero exit triggers rust-api-backup-alert@.service via OnFailure.
+set -Eeuo pipefail
+
+LIB_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib.sh
+. "$LIB_DIR/rust-api-backup-lib.sh"
+
+ENV_FILE="${BACKUP_ENV_FILE:-/etc/rust-api/backup.env}"
+[ -r "$ENV_FILE" ] || { echo "backup env not readable: $ENV_FILE" >&2; exit 1; }
+set -a
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+set +a
+
+: "${GCS_BUCKET:?GCS_BUCKET must be set}"
+: "${GCS_KEY_FILE:?GCS_KEY_FILE must be set}"
+: "${DATABASE_URL:=sqlite:///var/lib/rust-api/app.db}"
+: "${BACKUP_DIR:=/var/lib/rust-api/backups}"
+: "${LOCAL_KEEP_DAYS:=7}"
+: "${OFFSITE_KEEP_DAYS:=30}"
+
+DB_PATH="${DATABASE_URL#sqlite://}"
+[ -n "$DB_PATH" ] && [ "$DB_PATH" != "$DATABASE_URL" ] || DB_PATH="${DATABASE_URL#sqlite:}"
+[ -r "$DB_PATH" ] || { echo "database not readable: $DB_PATH" >&2; exit 1; }
+[ -r "$GCS_KEY_FILE" ] || { echo "backup key not readable: $GCS_KEY_FILE" >&2; exit 1; }
+
+install -d -m 0700 "$BACKUP_DIR" 2>/dev/null || true
+
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+snapshot="$BACKUP_DIR/app-$stamp.db"
+
+echo "backing up $DB_PATH (WAL online copy)"
+tmp_snapshot="$BACKUP_DIR/.app-$stamp.db.partial"
+sqlite_snapshot "$DB_PATH" "$tmp_snapshot" >&2 || { rm -f "$tmp_snapshot"; exit 1; }
+mv "$tmp_snapshot" "$snapshot"
+digest="$(sha256sum "$snapshot" | awk '{print $1}')"
+size="$(wc -c <"$snapshot" | tr -d ' ')"
+chmod 0600 "$snapshot"
+echo "snapshot $snapshot ($size bytes, sha256 $digest)"
+
+# Local quick-recovery copy + retention (app-latest.db is always overwritten).
+cp "$snapshot" "$BACKUP_DIR/.app-latest.db.tmp"
+mv "$BACKUP_DIR/.app-latest.db.tmp" "$BACKUP_DIR/app-latest.db"
+find "$BACKUP_DIR" -maxdepth 1 -name 'app-2*.db' -mtime "+$LOCAL_KEEP_DAYS" -print -delete |
+  sed 's|^|local retention: expired |'
+
+echo "uploading to gs://$GCS_BUCKET/snapshots/app-$stamp.db"
+gcs_upload "$GCS_KEY_FILE" "$GCS_BUCKET" "snapshots/app-$stamp.db" "$snapshot" || exit 1
+
+heartbeat="$(mktemp)"
+{
+  echo "backup ok $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "object snapshots/app-$stamp.db"
+  echo "sha256 $digest"
+  echo "size $size"
+  echo "host $(hostname)"
+} >"$heartbeat"
+gcs_upload "$GCS_KEY_FILE" "$GCS_BUCKET" "heartbeat.txt" "$heartbeat" "text/plain" ||
+  { rm -f "$heartbeat"; exit 1; }
+rm -f "$heartbeat"
+printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$digest" >"$BACKUP_DIR/last-backup-success"
+# A success clears the sticky ALERT marker (ALERT.log keeps the history);
+# systemctl --failed was already reset by the unit leaving failed state.
+rm -f "$BACKUP_DIR/ALERT"
+
+# Off-site retention over the expirable prefixes. The versions=true listing
+# marks superseded object versions with a timeDeleted field: noncurrent
+# versions older than the 7-day recovery window are purged, live snapshots
+# older than OFFSITE_KEEP_DAYS are expired. Alerts and the heartbeat stay.
+cutoff_live="$(iso_days_ago "$OFFSITE_KEEP_DAYS")"
+cutoff_versions="$(iso_days_ago 7)"
+deleted=0
+while IFS='|' read -r updated time_deleted generation name; do
+  [ -n "$name" ] || continue
+  case "$name" in
+    snapshots/* | drills/*) ;;
+    *) continue ;;
+  esac
+  if [ -n "$time_deleted" ]; then
+    if [ "${time_deleted%%T}" \< "$cutoff_versions" ]; then
+      gcs_delete "$GCS_KEY_FILE" "$GCS_BUCKET" "$name" "$generation" >/dev/null || true
+      echo "off-site retention: purged superseded version $name (generation $generation)"
+      deleted=$((deleted + 1))
+    fi
+  elif [ "${updated%%T}" \< "$cutoff_live" ]; then
+    # Live expiry deliberately omits the generation: the live version is
+    # archived first and only purged once it leaves the 7-day window.
+    gcs_delete "$GCS_KEY_FILE" "$GCS_BUCKET" "$name" >/dev/null || true
+    echo "off-site retention: expired $name (updated $updated)"
+    deleted=$((deleted + 1))
+  fi
+done < <(gcs_list "$GCS_KEY_FILE" "$GCS_BUCKET" "" || true)
+echo "off-site retention: $deleted object(s) expired"
+
+echo "backup complete: gs://$GCS_BUCKET/snapshots/app-$stamp.db"

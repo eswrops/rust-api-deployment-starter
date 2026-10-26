@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# rust-api-backup-alert UNIT_NAME: the OnFailure target for the backup and
+# drill units. Best-effort, never failing: writes a loud local marker and
+# uploads an alert object to the private bucket so the failure is visible
+# even if the VM later becomes unreachable. Absence of the daily heartbeat
+# object and this marker are the operator's dead-man switch.
+set -Eeuo pipefail
+
+FAILED_UNIT="${1:-unknown-unit}"
+LIB_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib.sh
+. "$LIB_DIR/rust-api-backup-lib.sh"
+
+ENV_FILE="${BACKUP_ENV_FILE:-/etc/rust-api/backup.env}"
+GCS_BUCKET="" GCS_KEY_FILE="" BACKUP_DIR="/var/lib/rust-api/backups"
+if [ -r "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
+: "${BACKUP_DIR:=/var/lib/rust-api/backups}"
+install -d -m 0700 "$BACKUP_DIR" 2>/dev/null || true
+
+now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+alert_file="$(mktemp)"
+{
+  echo "BACKUP FAILURE at $now"
+  echo "failed unit: $FAILED_UNIT"
+  echo "host: $(hostname)"
+  echo
+  echo "--- journal (last 30 lines) ---"
+  journalctl -u "$FAILED_UNIT" -n 30 --no-pager -o short-iso 2>/dev/null || echo "(journal unavailable)"
+} >"$alert_file"
+
+# Local, always visible to anyone on the box.
+cat "$alert_file" >"$BACKUP_DIR/ALERT"
+cat "$alert_file" >>"$BACKUP_DIR/ALERT.log"
+chmod 600 "$BACKUP_DIR/ALERT" "$BACKUP_DIR/ALERT.log" 2>/dev/null || true
+echo "ALERT: backup unit $FAILED_UNIT failed at $now" >&2
+echo "ALERT: see $BACKUP_DIR/ALERT, 'systemctl --failed', and journalctl -u $FAILED_UNIT" >&2
+
+# Off-site, visible without the VM.
+if [ -n "${GCS_BUCKET:-}" ] && [ -n "${GCS_KEY_FILE:-}" ] && [ -r "${GCS_KEY_FILE:-/nonexistent}" ]; then
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  if gcs_upload "$GCS_KEY_FILE" "$GCS_BUCKET" \
+    "alerts/$stamp-$FAILED_UNIT.txt" "$alert_file" "text/plain" 2>/dev/null; then
+    echo "ALERT: failure report uploaded to gs://$GCS_BUCKET/alerts/$stamp-$FAILED_UNIT.txt" >&2
+  else
+    echo "ALERT: could not upload failure report (check gs://$GCS_BUCKET/heartbeat.txt staleness)" >&2
+  fi
+fi
+rm -f "$alert_file"
+exit 0

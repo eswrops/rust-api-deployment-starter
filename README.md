@@ -157,7 +157,7 @@ The production service uses SQLite as its only database:
 - **Pragmas:** `journal_mode=WAL`, `foreign_keys=ON`, `busy_timeout=5s`, `synchronous=FULL` (a committed write survives power loss before the caller is told it succeeded).
 - **Migrations:** versioned, forward-only SQL in `migrations/`, embedded into the binary at compile time. They are applied **only** by the explicit `rust-api migrate` command (run as `rustapi` on the VM) — never at server startup or per request.
 - **Health:** `/health/ready` executes `SELECT 1` against the reader pool → `200 {"status":"ok",…}` or `503 {"status":"degraded","error":…}`. `/health/live` never touches the database.
-- **Backup/recovery:** see [docs/backup-recovery.md](docs/backup-recovery.md) (Litestream continuous replication + nightly `.backup` snapshots, with a restore-drill procedure).
+- **Backup/recovery (implemented):** daily online snapshots with local + private-GCS off-site copies, systemd timers, weekly automated restore drills, and OnFailure alerting — see [docs/backup-recovery.md](docs/backup-recovery.md).
 
 ### Deploying schema changes
 
