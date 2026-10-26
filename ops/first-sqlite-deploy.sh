@@ -85,13 +85,17 @@ if [ "$CURRENT_RELEASE" = "/opt/rust-api/releases/$GIT_SHA" ]; then
 fi
 
 step "3/7 stage the exact CI artifact onto the VM (IAP)"
-"${SCP[@]}" "$BINARY" "$INSTANCE:/home/deploy/incoming/rust-api-$GIT_SHA" >/dev/null
+# /home/deploy/incoming is 0700 deploy-owned, so upload to the operator home
+# first and install into place with the ownership rust-api-activate expects.
+"${SCP[@]}" "$BINARY" "$INSTANCE:first-sqlite-upload" >/dev/null
 vm "set -e
-  sudo test -f /home/deploy/incoming/rust-api-$GIT_SHA
-  actual=\$(sudo sha256sum /home/deploy/incoming/rust-api-$GIT_SHA | cut -d' ' -f1)
+  actual=\$(sha256sum ~/first-sqlite-upload | cut -d' ' -f1)
   [ \"\$actual\" = \"$DIGEST\" ] || { echo \"digest mismatch on VM: \$actual\"; exit 1; }
-  sudo chown deploy:deploy /home/deploy/incoming/rust-api-$GIT_SHA
-  sudo chmod 0644 /home/deploy/incoming/rust-api-$GIT_SHA
+  sudo install -o deploy -g deploy -m 0644 ~/first-sqlite-upload /home/deploy/incoming/rust-api-$GIT_SHA
+  rm ~/first-sqlite-upload
+  staged=\$(sudo sha256sum /home/deploy/incoming/rust-api-$GIT_SHA | cut -d' ' -f1)
+  [ \"\$staged\" = \"$DIGEST\" ] || { echo \"digest mismatch after install: \$staged\"; exit 1; }
+  sudo stat -c '%U:%G %a %n' /home/deploy/incoming/rust-api-$GIT_SHA
   echo 'staged artifact digest verified: OK'"
 
 step "4/7 prepare database directory and service environment"
@@ -126,15 +130,18 @@ vm "set -e
   dburl=\$(sudo grep '^DATABASE_URL=' /etc/rust-api/app.env | cut -d= -f2-)
   [ -n \"\$dburl\" ] || { echo 'DATABASE_URL missing from app.env'; exit 1; }
   echo \"migrating with DATABASE_URL=\$dburl as rustapi\"
-  sudo -u rustapi env DATABASE_URL=\"\$dburl\" /opt/rust-api/releases/$GIT_SHA/rust-api migrate
+  # runuser (invoked as root) drops to the rustapi service account; the
+  # operator sudoers rule grants root only, so 'sudo -u rustapi' would prompt.
+  sudo runuser -u rustapi -- env DATABASE_URL=\"\$dburl\" /opt/rust-api/releases/$GIT_SHA/rust-api migrate
   echo '--- second run (idempotency proof) ---'
-  sudo -u rustapi env DATABASE_URL=\"\$dburl\" /opt/rust-api/releases/$GIT_SHA/rust-api migrate
-  stat -c '%U:%G %a %n' /var/lib/rust-api/app.db*"
+  sudo runuser -u rustapi -- env DATABASE_URL=\"\$dburl\" /opt/rust-api/releases/$GIT_SHA/rust-api migrate
+  # The 0750 database directory blocks the non-root shell; stat through root.
+  sudo sh -c 'stat -c \"%U:%G %a %n\" /var/lib/rust-api/app.db*'"
 
 step "6/7 probe staged binary readiness against the real database"
 vm "set -e
   dburl=\$(sudo grep '^DATABASE_URL=' /etc/rust-api/app.env | cut -d= -f2-)
-  sudo -u rustapi env DATABASE_URL=\"\$dburl\" APP_BIND=127.0.0.1:18080 RUST_LOG=warn \
+  sudo runuser -u rustapi -- env DATABASE_URL=\"\$dburl\" APP_BIND=127.0.0.1:18080 RUST_LOG=warn \
     /opt/rust-api/releases/$GIT_SHA/rust-api >/tmp/staged-readiness.log 2>&1 &
   probe=\$!
   ok=0

@@ -42,6 +42,9 @@ jobs:
             exit 0
           fi
           echo "changed files:"; echo "$files"
+          # Operator tooling (ops/first-sqlite-deploy.sh) never triggers a
+          # release build or deploy: it is not part of the deployed artifact.
+          files="$(echo "$files" | grep -v '^ops/first-sqlite-deploy\.sh$' || true)"
           if echo "$files" | grep -qE '^(src/|migrations/|config/|ops/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|Dockerfile$|\.github/workflows/ci-deploy\.yml$)'; then
             echo "deploy=true" >> "$GITHUB_OUTPUT"
           else

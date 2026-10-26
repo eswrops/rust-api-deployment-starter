@@ -95,17 +95,33 @@ the script reports success):
 
 ## Execution record
 
-Deployment executed 2026-10-27:
+Deployment executed 2026-10-27 (UTC timestamps from the systems involved):
 
 | Step | Result |
 |---|---|
-| Push of release commit | <filled after execution> |
-| CI run (gate off): verify / benchmark / security / build | <filled after execution> |
-| Artifact digest (CI `rust-api.sha256`) | <filled after execution> |
-| `first-sqlite-deploy.sh`: staging, directory, permissions | <filled after execution> |
-| `rust-api migrate` (first / idempotency run) | <filled after execution> |
-| Staged `/health/ready` probe as rustapi | <filled after execution> |
-| Rollback-path verification | <filled after execution> |
-| Gate enabled; CI deploy run (build + deploy) | <filled after execution> |
-| Post-deploy: `/health/live`, `/health/ready`, systemd, public HTTPS | <filled after execution> |
-| Deployed commit SHA | <filled after execution> |
+| Release commit pushed | `0f7c3956372e43888d9634b703def81993388fa5` (run `40380998124`, 2026-10-26T18:48Z) |
+| CI run with gate off | **success** — changes / verify / benchmark (upstream 42 checks) / security / build green; `deploy` **skipped** by gate |
+| Artifact digest (CI `rust-api.sha256`) | `f3321bb1e67a5c03ac9da5a2ce36bc0fddaf555dbef2f0cb9efebdb104f32ee1` (6,294,704 bytes), verified locally and on the VM after staging |
+| `first-sqlite-deploy.sh` staging/permissions | staged as `deploy:deploy 644 /home/deploy/incoming/rust-api-0f7c3956…`; installed to `/opt/rust-api/releases/0f7c3956…/rust-api` `root:root 755`; `current` symlink untouched throughout |
+| Database directory | `/var/lib/rust-api` on `ext4` (persistent boot disk, not tmpfs), `rustapi:rustapi 750`; `DATABASE_URL=sqlite:///var/lib/rust-api/app.db` set in `/etc/rust-api/app.env` (`root:root 600`) |
+| `rust-api migrate` as rustapi | first run `applied 1 pending migration(s)`; rerun `applied 0 pending migration(s)` (idempotency proven); `app.db` `rustapi:rustapi 644` |
+| Staged `/health/ready` rehearsal | `200 {"status":"ok","version":"0f7c3956…"}` as the `rustapi` user on scratch port 18080; systemd service not touched |
+| Rollback-path verification | `rust-api-activate` present (`root:root 755`), sudoers rule `deploy ALL=(root) NOPASSWD: /usr/local/sbin/rust-api-activate` intact, previous release `d23868aa…` (digest `6a92d944…`) preserved |
+| Gate enabled; CI deploy | `PRODUCTION_DEPLOY_ENABLED=true`; dispatch run `40382625356` — all six jobs **success** including `deploy` (2026-10-26T19:01Z); activation log: `deployed 0f7c3956372e43888d9634b703def81993388fa5` |
+| Post-deploy: systemd | `rust-api` active/running (PID restarted 19:01:44 UTC), clean journal start with `database=sqlite:///var/lib/rust-api/app.db` |
+| Post-deploy: local health | `/health/live` and `/health/ready` → `200 {"status":"ok","version":"0f7c3956…"}` |
+| Post-deploy: public HTTPS | `https://api-bench.thetechs.top/health/live` and `/health/ready` → `200` with the new version, verified from the VM and from an external network |
+| Deployed commit SHA | `0f7c3956372e43888d9634b703def81993388fa5` |
+
+Notes from the run:
+
+- The CI-built artifact from the verification run and the artifact built by the
+  deploy run are **byte-identical** (same digest `f3321bb1…`): the pinned
+  toolchain and lockfile make the release build reproducible, so the binary
+  that rehearsed the migration is the binary that is running.
+- The operator sudoers rule on the VM is `ALL=(root)`, so the script invokes
+  migrations through `sudo runuser -u rustapi --` rather than
+  `sudo -u rustapi` (which would need an interactive password).
+- `/home/deploy/incoming` is 0700 `deploy`-owned, so the script uploads to the
+  operator home and `sudo install`s the artifact into place with the exact
+  ownership `rust-api-activate` requires.
