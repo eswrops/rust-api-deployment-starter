@@ -10,7 +10,7 @@
 set -Eeuo pipefail
 
 LIB_DIR="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck source=lib.sh
+# shellcheck source=rust-api-backup-lib.sh
 . "$LIB_DIR/rust-api-backup-lib.sh"
 
 ENV_FILE="${BACKUP_ENV_FILE:-/etc/rust-api/backup.env}"
@@ -36,9 +36,11 @@ fail_drill() { echo "DRILL FAIL: $*" | tee -a "$report" >&2; exit 1; }
 echo "restore drill $(date -u +%Y-%m-%dT%H:%M:%SZ): bucket gs://$GCS_BUCKET" | tee "$report"
 
 # 1. Newest LIVE snapshot from the bucket — the VM-loss path, never a local
-#    file. $2 is timeDeleted: empty means the current live version.
+#    file. $2 is timeDeleted: empty means the current live version. sed -n
+#    instead of head keeps the pipeline reading to EOF (a SIGPIPE'd sort
+#    would abort the drill under pipefail once the listing spans pages).
 newest="$(gcs_list "$GCS_KEY_FILE" "$GCS_BUCKET" "snapshots/" |
-  awk -F'|' '$2 == "" && $4 != "" {print $1 "|" $4}' | sort -r | head -1 | cut -d'|' -f2)"
+  awk -F'|' '$2 == "" && $4 != "" {print $1 "|" $4}' | sort -r | sed -n '1p' | cut -d'|' -f2)"
 [ -n "$newest" ] || fail_drill "no snapshot found under snapshots/ in gs://$GCS_BUCKET"
 echo "newest off-site snapshot: $newest" | tee -a "$report"
 

@@ -1,0 +1,47 @@
+name: Backup freshness monitor
+# External dead-man's switch for the SQLite backup pipeline: scheduled
+# OUTSIDE the VM, it fails loudly when the off-site heartbeat or the last
+# restore drill goes stale — including the case where the VM (and its own
+# alerting) is gone. Read-only against the backup bucket.
+#
+# Deliberately gated on a repository variable: this workflow ships before
+# ops/gce-configure-backup-monitor.sh has been run, and must not fail every
+# six hours for a missing service account. Enabling is part of the approved
+# monitoring cutover:
+#   ops/gce-configure-backup-monitor.sh   # creates the monitor identity,
+#                                         # then sets BACKUP_FRESHNESS_MONITOR_ENABLED=true
+# The alert destination is this workflow's run history: a red scheduled run
+# is the alarm (subscribe to failure notifications for this workflow).
+on:
+  schedule:
+    # Every 6 hours at :45; the heartbeat check allows 30 h of staleness, so
+    # a single missed run never alarms.
+    - cron: "45 */6 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  freshness:
+    if: vars.BACKUP_FRESHNESS_MONITOR_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # Read-only monitor identity; impersonation is restricted (at the SA
+      # binding condition, once configured) to this workflow on main.
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Authenticate as the read-only backup monitor
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_BACKUP_MONITOR_SERVICE_ACCOUNT }}
+      - name: Install Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+      - name: Check heartbeat and drill freshness
+        env:
+          GCS_BUCKET: ${{ vars.BACKUP_BUCKET }}
+        run: |
+          set -Eeuo pipefail
+          test -n "$GCS_BUCKET" || { echo "BACKUP_BUCKET repository variable is not set" >&2; exit 1; }
+          ops/backup/backup-freshness-check

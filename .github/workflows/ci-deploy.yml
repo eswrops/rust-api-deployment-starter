@@ -11,9 +11,11 @@ on:
         description: "Idle keep-alive connections for the memory benchmark"
         default: "3000"
         type: string
+# Default: no job can mint Google credentials. The deploy job is the only
+# job granted `id-token: write` (job-scoped below), so pull-request runs of
+# verify/benchmark/security hold nothing beyond repository read access.
 permissions:
   contents: read
-  id-token: write
 
 # Third-party actions are pinned to reviewed full commit SHAs (the tag each
 # SHA resolves to is noted next to it). Update pins deliberately.
@@ -178,6 +180,12 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     environment: production
+    permissions:
+      contents: read
+      # Only the deploy job may request a Google OIDC credential. It is kept
+      # out of the workflow-level defaults so no other job can impersonate
+      # the deployer service account.
+      id-token: write
     concurrency:
       group: rust-api-production
       cancel-in-progress: false
@@ -197,12 +205,23 @@ jobs:
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GCE_INSTANCE: ${{ vars.GCE_INSTANCE }}
           GCE_ZONE: ${{ vars.GCE_ZONE }}
+          # Public sshd host keys of rust-api-prod, collected by the operator
+          # over IAP (read-only) and stored as a repository variable. Public
+          # key material is not a secret; pinning it turns SSH host
+          # verification from trust-on-first-use into strict checking.
+          DEPLOY_HOST_PUBLIC_KEY: ${{ vars.DEPLOY_HOST_PUBLIC_KEY }}
         run: |
           set -Eeuo pipefail
           test -n "$GCP_PROJECT_ID"
           test -n "$GCE_INSTANCE"
           test -n "$GCE_ZONE"
           sha256sum --check rust-api.sha256
+          # Fail before any connection is made if host pinning is not set up:
+          # a deploy without a pinned host key must not fall back to TOFU.
+          test -n "$DEPLOY_HOST_PUBLIC_KEY" || {
+            echo "DEPLOY_HOST_PUBLIC_KEY repository variable is not set; refusing to deploy without pinned host keys" >&2
+            exit 1
+          }
           key="$RUNNER_TEMP/rust-api-deploy"
           ssh-keygen -q -t ed25519 -N '' -f "$key"
           common=(
@@ -216,7 +235,14 @@ jobs:
           ssh_keys="$RUNNER_TEMP/instance-ssh-keys"
           gcloud compute instances describe "$GCE_INSTANCE" "${common[@]}" --format=json \
             | jq -r '.metadata.items[]? | select(.key == "ssh-keys") | .value' \
-            | grep -v '^deploy:' >"$ssh_keys" || true
+            | grep -v '^deploy:' >"$ssh_keys"
+          # A failed describe or filter must abort before add-metadata: that
+          # call REPLACES the ssh-keys metadata and would otherwise wipe the
+          # operator's keys.
+          test -s "$ssh_keys" || {
+            echo "no operator SSH keys found in instance metadata; refusing to rewrite ssh-keys" >&2
+            exit 1
+          }
           expires="$(date --utc --date='+10 minutes' --iso-8601=seconds)"
           printf 'deploy:%s google-ssh {"userName":"deploy","expireOn":"%s"}\n' \
             "$(<"$key.pub")" "$expires" >>"$ssh_keys"
@@ -236,12 +262,19 @@ jobs:
             wait "$tunnel_pid" 2>/dev/null || true
           }
           trap cleanup EXIT
+          # Pinned host keys, entries scoped to [127.0.0.1]:2222. With
+          # StrictHostKeyChecking=yes a changed or unexpected host key fails
+          # the job before any payload or command is sent.
+          pinned_known_hosts="$RUNNER_TEMP/pinned_known_hosts"
+          while IFS= read -r host_key; do
+            printf '[127.0.0.1]:%s %s\n' "$local_port" "$host_key"
+          done < <(printf '%s\n' "$DEPLOY_HOST_PUBLIC_KEY") >"$pinned_known_hosts"
           ssh_options=(
             -i "$key"
             -p "$local_port"
             -o BatchMode=yes
-            -o StrictHostKeyChecking=accept-new
-            -o UserKnownHostsFile="$RUNNER_TEMP/google_compute_known_hosts"
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$pinned_known_hosts"
           )
           # With IAP's connection preflight disabled, gcloud does not emit a
           # "Listening on port" message. The authenticated SSH test below is
@@ -254,12 +287,16 @@ jobs:
             sleep 2
           done
           ssh "${ssh_options[@]}" deploy@127.0.0.1 true
+          destination="deploy@127.0.0.1:/home/deploy/incoming/rust-api-${GITHUB_SHA}"
           scp -i "$key" -P "$local_port" \
             -o BatchMode=yes \
-            -o StrictHostKeyChecking=accept-new \
-            -o UserKnownHostsFile="$RUNNER_TEMP/google_compute_known_hosts" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$pinned_known_hosts" \
             rust-api \
-            "deploy@127.0.0.1:/home/deploy/incoming/rust-api-${GITHUB_SHA}"
+            "$destination"
           digest="$(sha256sum rust-api | awk '{print $1}')"
-          ssh "${ssh_options[@]}" deploy@127.0.0.1 \
-            "sudo /usr/local/sbin/rust-api-activate '${GITHUB_SHA}' '${digest}'"
+          activate_cmd="sudo /usr/local/sbin/rust-api-activate '${GITHUB_SHA}' '${digest}'"
+          # Client-side expansion is deliberate: the remote command must
+          # receive this run's SHA and digest as literal arguments.
+          # shellcheck disable=SC2029
+          ssh "${ssh_options[@]}" deploy@127.0.0.1 "$activate_cmd"

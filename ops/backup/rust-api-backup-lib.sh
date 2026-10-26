@@ -4,7 +4,12 @@
 # JWT exchanged via curl + openssl — no Google SDK is installed on the VM.
 # shellcheck shell=bash
 
-GCS_TOKEN_URL="https://oauth2.googleapis.com/token"
+GCS_TOKEN_URL="${GCS_TOKEN_URL:-https://oauth2.googleapis.com/token}"
+GCS_API_BASE="${GCS_API_BASE:-https://storage.googleapis.com}"
+# Request timeouts (seconds). Overridable so tests can exercise timeout
+# behavior against a slow mock instead of waiting for a real 60 s stall.
+GCS_HTTP_TIMEOUT="${GCS_HTTP_TIMEOUT:-60}"
+GCS_UPLOAD_TIMEOUT="${GCS_UPLOAD_TIMEOUT:-180}"
 GCS_SCOPE="https://www.googleapis.com/auth/devstorage.read_write"
 
 b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
@@ -48,10 +53,10 @@ PY
 gcs_upload() {
   local key="$1" bucket="$2" name="$3" file="$4" ctype="${5:-application/octet-stream}" token code
   token="$(gcs_token "$key")" || return 1
-  code="$(curl -sS --max-time 180 -o /tmp/gcs-upload-response.$$ -w '%{http_code}' \
+  code="$(curl -sS --max-time "$GCS_UPLOAD_TIMEOUT" -o /tmp/gcs-upload-response.$$ -w '%{http_code}' \
     -X POST -H "Authorization: Bearer $token" -H "Content-Type: $ctype" \
     --data-binary @"$file" \
-    "https://storage.googleapis.com/upload/storage/v1/b/$bucket/o?uploadType=media&name=$name" )" || { rm -f /tmp/gcs-upload-response.$$; return 1; }
+    "${GCS_API_BASE}/upload/storage/v1/b/$bucket/o?uploadType=media&name=$name" )" || { rm -f /tmp/gcs-upload-response.$$; return 1; }
   [ "$code" = "200" ] || { echo "gcs_upload $name -> HTTP $code: $(head -c 300 /tmp/gcs-upload-response.$$)" >&2; rm -f /tmp/gcs-upload-response.$$; return 1; }
   rm -f /tmp/gcs-upload-response.$$
 }
@@ -65,9 +70,9 @@ gcs_download() {
   local key="$1" bucket="$2" name="$3" out="$4" token code encoded
   token="$(gcs_token "$key")" || return 1
   encoded="$(gcs_encoded_name "$name")"
-  code="$(curl -sS --max-time 180 -o "$out" -w '%{http_code}' \
+  code="$(curl -sS --max-time "$GCS_HTTP_TIMEOUT" -o "$out" -w '%{http_code}' \
     -H "Authorization: Bearer $token" \
-    "https://storage.googleapis.com/storage/v1/b/$bucket/o/$encoded?alt=media")" || return 1
+    "${GCS_API_BASE}/storage/v1/b/$bucket/o/$encoded?alt=media")" || return 1
   [ "$code" = "200" ] || { echo "gcs_download $name -> HTTP $code" >&2; return 1; }
 }
 
@@ -76,23 +81,43 @@ gcs_download() {
 #   (live objects have an empty timeDeleted; superseded versions carry one;
 #   '|' separates fields because `read` collapses runs of IFS whitespace and
 #   would destroy the empty timeDeleted field)
+#
+# Follows nextPageToken to the end of the listing: a truncated listing would
+# silently exempt objects from retention and can hide the newest snapshot
+# from the restore drill. Any HTTP, token or malformed-JSON failure returns
+# non-zero with nothing (or only already-printed pages) on stdout, so
+# callers can distinguish a complete listing from a partial one.
 gcs_list() {
-  local key="$1" bucket="$2" prefix="$3" token
+  local key="$1" bucket="$2" prefix="$3" token page page_token=""
   token="$(gcs_token "$key")" || return 1
-  curl -fsS --max-time 60 -G -H "Authorization: Bearer $token" \
-    --data-urlencode "prefix=$prefix" --data-urlencode "versions=true" --data-urlencode "maxResults=1000" \
-    "https://storage.googleapis.com/storage/v1/b/$bucket/o" |
-    jq -r '.items[]? | [.updated, (.timeDeleted // ""), .generation, .name] | join("|")'
+  while :; do
+    page="$(curl -fsS --max-time "$GCS_HTTP_TIMEOUT" -G -H "Authorization: Bearer $token" \
+      --data-urlencode "prefix=$prefix" --data-urlencode "versions=true" --data-urlencode "maxResults=1000" \
+      ${page_token:+--data-urlencode "pageToken=$page_token"} \
+      "${GCS_API_BASE}/storage/v1/b/$bucket/o")" || {
+        echo "gcs_list: listing gs://$bucket/$prefix failed" >&2
+        return 1
+      }
+    # Validate the page shape before emitting items: a malformed response
+    # must fail the call, not silently produce an empty listing. The token
+    # probe and the item projection parse the same JSON twice on purpose —
+    # the probe runs with an error-on-type guard the projection cannot use.
+    page_token="$(jq -er 'if type == "object" then (.nextPageToken // "") else error("not an object") end' <<<"$page")" ||
+      { echo "gcs_list: malformed listing response from gs://$bucket" >&2; return 1; }
+    jq -r '.items[]? | [.updated, (.timeDeleted // ""), .generation, .name] | join("|")' <<<"$page"
+    [ -n "$page_token" ] || return 0
+  done
 }
 
 # gcs_delete KEY BUCKET NAME [GENERATION]
+#   -> 0 on HTTP 204 (deleted) or 404 (already absent: safe retention race)
 gcs_delete() {
   local key="$1" bucket="$2" name="$3" gen="${4:-}" token code url encoded
   token="$(gcs_token "$key")" || return 1
   encoded="$(gcs_encoded_name "$name")"
-  url="https://storage.googleapis.com/storage/v1/b/$bucket/o/$encoded"
+  url="${GCS_API_BASE}/storage/v1/b/$bucket/o/$encoded"
   [ -n "$gen" ] && url="$url?generation=$gen"
-  code="$(curl -sS --max-time 60 -o /dev/null -w '%{http_code}' -X DELETE \
+  code="$(curl -sS --max-time "$GCS_HTTP_TIMEOUT" -o /dev/null -w '%{http_code}' -X DELETE \
     -H "Authorization: Bearer $token" "$url")" || return 1
   { [ "$code" = "204" ] || [ "$code" = "404" ]; } || { echo "gcs_delete $name -> HTTP $code" >&2; return 1; }
 }
