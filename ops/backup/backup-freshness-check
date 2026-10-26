@@ -37,11 +37,11 @@ failures=0
 note() { echo "freshness: $*"; }
 fail() { echo "freshness: FAIL: $*" >&2; failures=$((failures + 1)); }
 
-# Token precedence: GCS_ACCESS_TOKEN env (CI passes the WIF-federated
-# access token from the auth step's output — `gcloud auth print-access-
-# token` cannot mint SA tokens on the iamcredentials path without
-# serviceAccountTokenCreator), falling back to the local gcloud identity
-# (operator workstation use).
+# Token precedence: GCS_ACCESS_TOKEN env (passed by CI if its auth step
+# provides one), falling back to the local/CI gcloud identity. The gcloud
+# path mints an SA token through iamcredentials, which for federated
+# (WIF) callers requires roles/iam.serviceAccountTokenCreator on the SA —
+# granted to the repository-restricted WIF principal for this monitor.
 if [ -n "${GCS_ACCESS_TOKEN:-}" ]; then
   token="$GCS_ACCESS_TOKEN"
 else
@@ -65,6 +65,13 @@ gcs_get() {
 }
 show_body() { echo "freshness: response: $(head -c 200 "$body")" >&2; }
 
+# On a 403, identify the failing token (email/scope) so permission issues
+# can be attributed to the right identity instead of guessed at.
+show_tokeninfo() {
+  curl -sS --max-time 10 "https://oauth2.googleapis.com/tokeninfo?access_token=$token" 2>/dev/null \
+    | jq -r 'if .email then "token identity: \(.email // "?") scope: \(.scope // "?")" else "tokeninfo unavailable" end' >&2 || true
+}
+
 # iso_age_seconds TIMESTAMP -> age in seconds (python3: portable date math)
 iso_age_seconds() {
   python3 - "$1" <<'PY'
@@ -77,7 +84,7 @@ PY
 # 1. Heartbeat: proves a recent successful snapshot + off-site upload.
 code="$(gcs_get "/o/heartbeat.txt?alt=media")" || code="network"
 if [ "$code" != "200" ]; then
-  [ "$code" != "network" ] && show_body
+  [ "$code" != "network" ] && { show_body; [ "$code" = "403" ] && show_tokeninfo; }
   fail "heartbeat read returned HTTP $code (missing heartbeat = backup pipeline broken or VM lost)"
 else
   ts="$(sed -n 's/^backup ok \([0-9T:-]*Z\)$/\1/p' "$body" | tail -1)"
@@ -97,7 +104,7 @@ fi
 #    return in name order, so the newest report is the last drills/ item.
 code="$(gcs_get "/o?prefix=drills/&fields=items(name)&maxResults=999")" || code="network"
 if [ "$code" != "200" ]; then
-  [ "$code" != "network" ] && show_body
+  [ "$code" != "network" ] && { show_body; [ "$code" = "403" ] && show_tokeninfo; }
   fail "drill listing returned HTTP $code"
 else
   newest="$(jq -r '.items[]?.name // empty' "$body" | grep -E '^drills/drill-[0-9T]+Z\.txt$' | sort | tail -1)"
