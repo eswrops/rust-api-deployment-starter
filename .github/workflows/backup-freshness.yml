@@ -32,15 +32,25 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Authenticate as the read-only backup monitor
+        id: auth
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
         with:
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
           service_account: ${{ vars.GCP_BACKUP_MONITOR_SERVICE_ACCOUNT }}
+          # The check script calls the GCS JSON API with this token. Avoid
+          # `gcloud auth print-access-token` here: with federated WIF
+          # credentials it routes through iamcredentials.generateAccessToken,
+          # which requires serviceAccountTokenCreator on the SA — a grant the
+          # WIF principal deliberately does not hold. The auth action's
+          # access-token output comes from the STS exchange path, which
+          # workloadIdentityUser covers.
+          token_format: access_token
       - name: Install Google Cloud CLI
         uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
       - name: Check heartbeat and drill freshness
         env:
           GCS_BUCKET: ${{ vars.BACKUP_BUCKET }}
+          GCS_ACCESS_TOKEN: ${{ steps.auth.outputs.auth_token }}
         run: |
           set -Eeuo pipefail
           test -n "$GCS_BUCKET" || { echo "BACKUP_BUCKET repository variable is not set" >&2; exit 1; }
