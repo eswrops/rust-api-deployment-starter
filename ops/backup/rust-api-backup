@@ -8,7 +8,7 @@
 set -Eeuo pipefail
 
 LIB_DIR="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck source=lib.sh
+# shellcheck source=rust-api-backup-lib.sh
 . "$LIB_DIR/rust-api-backup-lib.sh"
 
 ENV_FILE="${BACKUP_ENV_FILE:-/etc/rust-api/backup.env}"
@@ -24,6 +24,10 @@ set +a
 : "${BACKUP_DIR:=/var/lib/rust-api/backups}"
 : "${LOCAL_KEEP_DAYS:=7}"
 : "${OFFSITE_KEEP_DAYS:=30}"
+# Live off-site snapshots that retention must never expire, regardless of
+# age. The newest snapshots are protected so a stale or misdated bucket can
+# never be driven to zero recoverable copies by the retention pass itself.
+: "${MIN_LIVE_SNAPSHOTS:=3}"
 
 DB_PATH="${DATABASE_URL#sqlite://}"
 [ -n "$DB_PATH" ] && [ "$DB_PATH" != "$DATABASE_URL" ] || DB_PATH="${DATABASE_URL#sqlite:}"
@@ -73,9 +77,27 @@ rm -f "$BACKUP_DIR/ALERT"
 # marks superseded object versions with a timeDeleted field: noncurrent
 # versions older than the 7-day recovery window are purged, live snapshots
 # older than OFFSITE_KEEP_DAYS are expired. Alerts and the heartbeat stay.
+#
+# Failure semantics: a listing failure aborts retention with a non-zero
+# exit (the OnFailure alert fires) — retention must never run on a partial
+# listing. Deletion failures are counted per object, reported, and fail the
+# run; only successful API operations are reported as deletions. 404 is a
+# safe retention race (object already gone), not a failure.
 cutoff_live="$(iso_days_ago "$OFFSITE_KEEP_DAYS")"
 cutoff_versions="$(iso_days_ago 7)"
+listing="$(gcs_list "$GCS_KEY_FILE" "$GCS_BUCKET" "")" || {
+  echo "off-site retention: listing failed; retention NOT attempted (snapshot and heartbeat above are unaffected)" >&2
+  exit 1
+}
+# The newest MIN_LIVE_SNAPSHOTS live snapshots by updated timestamp are
+# exempt from expiry, whatever their age. sed -n (not head) so the pipeline
+# reads to EOF: an early-exiting reader would SIGPIPE the sort and, under
+# pipefail, kill the whole run on buckets larger than a page.
+protected_live="$(printf '%s\n' "$listing" \
+  | awk -F'|' '$2 == "" && $4 ~ /^snapshots\// {print $1 "|" $4}' \
+  | sort -r | sed -n "1,${MIN_LIVE_SNAPSHOTS}p" | cut -d'|' -f2)"
 deleted=0
+failed_deletes=0
 while IFS='|' read -r updated time_deleted generation name; do
   [ -n "$name" ] || continue
   case "$name" in
@@ -83,19 +105,32 @@ while IFS='|' read -r updated time_deleted generation name; do
     *) continue ;;
   esac
   if [ -n "$time_deleted" ]; then
-    if [ "${time_deleted%%T}" \< "$cutoff_versions" ]; then
-      gcs_delete "$GCS_KEY_FILE" "$GCS_BUCKET" "$name" "$generation" >/dev/null || true
-      echo "off-site retention: purged superseded version $name (generation $generation)"
-      deleted=$((deleted + 1))
-    fi
-  elif [ "${updated%%T}" \< "$cutoff_live" ]; then
+    [ "${time_deleted%%T}" \< "$cutoff_versions" ] || continue
+    reason="purged superseded version (updated $updated)"
+    gen="$generation"
+  elif [ "${updated%%T}" \< "$cutoff_live" ] && ! grep -Fxq "$name" <<<"$protected_live"; then
     # Live expiry deliberately omits the generation: the live version is
     # archived first and only purged once it leaves the 7-day window.
-    gcs_delete "$GCS_KEY_FILE" "$GCS_BUCKET" "$name" >/dev/null || true
-    echo "off-site retention: expired $name (updated $updated)"
-    deleted=$((deleted + 1))
+    reason="expired (updated $updated)"
+    gen=""
+  else
+    continue
   fi
-done < <(gcs_list "$GCS_KEY_FILE" "$GCS_BUCKET" "" || true)
-echo "off-site retention: $deleted object(s) expired"
+  # $gen is intentionally unquoted: empty means "expire the live version"
+  # (no generation argument), non-empty passes the version's generation.
+  # shellcheck disable=SC2086
+  if gcs_delete "$GCS_KEY_FILE" "$GCS_BUCKET" "$name" $gen >/dev/null; then
+    echo "off-site retention: deleted $name ($reason)"
+    deleted=$((deleted + 1))
+  else
+    echo "off-site retention: FAILED to delete $name (generation ${gen:-live}) — object left in place" >&2
+    failed_deletes=$((failed_deletes + 1))
+  fi
+done < <(printf '%s\n' "$listing")
+echo "off-site retention: $deleted object(s) expired, $failed_deletes deletion(s) failed"
+[ "$failed_deletes" -eq 0 ] || {
+  echo "off-site retention: INCOMPLETE — deletion failures must be investigated (bucket retains all undeleted objects)" >&2
+  exit 1
+}
 
 echo "backup complete: gs://$GCS_BUCKET/snapshots/app-$stamp.db"

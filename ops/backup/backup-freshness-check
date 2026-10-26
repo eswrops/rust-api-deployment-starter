@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# backup-freshness-check: external dead-man's-switch check for the SQLite
+# backup pipeline. Runs OUTSIDE the VM (GitHub Actions schedule or any
+# operator workstation with gcloud + read access to the bucket), so it
+# detects a stale backup even when the VM — and the VM's own alerting — is
+# gone. Read-only: it never writes to the bucket.
+#
+# Checks (against the private bucket):
+#   1. heartbeat.txt exists and its "backup ok <ISO>" timestamp is fresher
+#      than BACKUP_MAX_AGE_HOURS (default 30: daily timer + one skipped day
+#      of grace).
+#   2. the newest drills/drill-*.txt report is fresher than
+#      DRILL_MAX_AGE_DAYS (default 9: weekly timer + grace).
+# Any GCS access error surfaces as a non-zero exit (a red run IS the alarm).
+#
+# Environment:
+#   GCS_BUCKET           bucket name (required)
+#   BACKUP_MAX_AGE_HOURS default 30
+#   DRILL_MAX_AGE_DAYS   default 9
+set -Eeuo pipefail
+
+bucket="${GCS_BUCKET:?GCS_BUCKET must be set}"
+max_backup_hours="${BACKUP_MAX_AGE_HOURS:-30}"
+max_drill_days="${DRILL_MAX_AGE_DAYS:-9}"
+failures=0
+
+note() { echo "freshness: $*"; }
+fail() { echo "freshness: FAIL: $*" >&2; failures=$((failures + 1)); }
+
+# iso_age_seconds TIMESTAMP -> age in seconds (python3: portable date math)
+iso_age_seconds() {
+  python3 - "$1" <<'PY'
+import datetime, sys
+ts = datetime.datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+print(int((datetime.datetime.now(datetime.timezone.utc) - ts).total_seconds()))
+PY
+}
+
+# 1. Heartbeat: proves a recent successful snapshot + off-site upload.
+if ! heartbeat="$(gcloud storage cat "gs://${bucket}/heartbeat.txt" 2>&1)"; then
+  fail "cannot read gs://${bucket}/heartbeat.txt (missing heartbeat = backup pipeline broken or VM lost)"
+  gcloud storage cat "gs://${bucket}/heartbeat.txt" >/dev/null 2>&1 || true
+else
+  ts="$(sed -n 's/^backup ok \([0-9T:-]*Z\)$/\1/p' <<<"$heartbeat" | tail -1)"
+  if [ -z "$ts" ]; then
+    fail "heartbeat present but no 'backup ok <ISO>' line: $(head -1 <<<"$heartbeat")"
+  else
+    age="$(iso_age_seconds "$ts")"
+    if [ "$age" -gt "$((max_backup_hours * 3600))" ]; then
+      fail "last successful backup is $((age / 3600))h old (limit ${max_backup_hours}h): heartbeat $ts"
+    else
+      note "heartbeat ok: last backup $((age / 3600))h ago ($ts)"
+    fi
+  fi
+fi
+
+# 2. Restore drill: proves the off-site copies actually restore.
+drills="$(gcloud storage ls "gs://${bucket}/drills/*" 2>/dev/null | grep -oE 'drill-[0-9T]+Z\.txt$' | sort | tail -1 || true)"
+if [ -z "$drills" ]; then
+  fail "no drill reports under gs://${bucket}/drills/ — weekly restore drill has never succeeded"
+else
+  stamp="${drills#drill-}"; stamp="${stamp%.txt}"
+  ts="${stamp:0:4}-${stamp:4:2}-${stamp:6:2}T${stamp:9:2}:${stamp:11:2}:${stamp:13:2}Z"
+  age_days=$(( $(iso_age_seconds "$ts") / 86400 ))
+  if [ "$age_days" -gt "$max_drill_days" ]; then
+    fail "last restore drill is ${age_days}d old (limit ${max_drill_days}d): $drills"
+  else
+    note "drill ok: last report ${age_days}d ago ($drills)"
+  fi
+fi
+
+if [ "$failures" -gt 0 ]; then
+  echo "freshness: ${failures} check(s) failed — inspect gs://${bucket} and the backup journal" >&2
+  exit 1
+fi
+echo "freshness: all checks passed"

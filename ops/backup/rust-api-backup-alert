@@ -8,7 +8,7 @@ set -Eeuo pipefail
 
 FAILED_UNIT="${1:-unknown-unit}"
 LIB_DIR="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck source=lib.sh
+# shellcheck source=rust-api-backup-lib.sh
 . "$LIB_DIR/rust-api-backup-lib.sh"
 
 ENV_FILE="${BACKUP_ENV_FILE:-/etc/rust-api/backup.env}"

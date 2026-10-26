@@ -13,7 +13,7 @@ service account:
 | Layer | What | Where | Retention |
 |---|---|---|---|
 | Local quick recovery | Online `sqlite3` backup-API snapshot (`app-YYYYmmddTHHMMSSZ.db` + `app-latest.db`) | `/var/lib/rust-api/backups` (0750 rustapi) | 7 daily (`LOCAL_KEEP_DAYS`) |
-| Off-site | Same snapshot uploaded to a **private** GCS bucket, plus heartbeat / drill / alert objects | `gs://rust-api-prod-backups-650296500144` (us-west1, STANDARD) | 30 daily live (`OFFSITE_KEEP_DAYS`); superseded versions purged after 7 days |
+| Off-site | Same snapshot uploaded to a **private** GCS bucket, plus heartbeat / drill / alert objects | `gs://rust-api-prod-backups-650296500144` (us-west1, STANDARD) | 30 daily live (`OFFSITE_KEEP_DAYS`), **at least `MIN_LIVE_SNAPSHOTS` (3) live snapshots kept regardless of age**; superseded versions purged after 7 days |
 
 Additional safety properties of the bucket (all verified):
 
@@ -26,6 +26,15 @@ Additional safety properties of the bucket (all verified):
   recoverable for a week.
 - Live snapshot expiry *archives first and purges later*, so an expired
   snapshot still passes through the 7-day windows.
+- **Minimum-snapshot preservation** (`MIN_LIVE_SNAPSHOTS`, default 3): the
+  newest live snapshots are never expired regardless of age, so retention
+  can never intentionally drive the bucket to zero recoverable copies.
+- **Complete, fail-visible listing**: the GCS listing follows
+  `nextPageToken` to the end (no silent truncation at 1000 objects), and a
+  failed listing or failed deletion is a hard, alerted failure — retention
+  never runs on a partial listing, and an object is only reported deleted
+  when the delete actually succeeded (HTTP 404 is treated as the safe
+  already-absent race, not a failure).
 
 RPO is 24 h (daily timer at 04:15 UTC, `Persistent=true` so a missed run
 fires at boot). The documented upgrade path to near-continuous RPO is
@@ -80,10 +89,36 @@ re-running refreshes scripts and re-verifies a full backup + drill cycle).
    daily `heartbeat.txt` object stops refreshing — any check of
    `gs://…/heartbeat.txt` older than ~48 h is an alarm even when the VM
    cannot report anything.
+5. **External freshness monitor** (scheduled GitHub Actions, see next
+   section): automates check 4 and the drill-staleness check from outside
+   the VM; a red scheduled run is the alarm.
 
 There is deliberately no email/pager integration (no monitoring stack on the
-VM by constraint); the four channels above are the alert surface. Wire
-channel 4 into an external checker if you need push-style paging.
+VM by constraint); the five channels above are the alert surface. GitHub
+failure notifications for the `backup-freshness` workflow provide the
+push-style paging path.
+
+## External freshness monitoring
+
+`ops/backup/backup-freshness-check` (read-only) verifies two ages directly
+against the bucket, from OUTSIDE the VM:
+
+1. `heartbeat.txt` fresher than `BACKUP_MAX_AGE_HOURS` (default 30).
+2. the newest `drills/drill-*.txt` report fresher than `DRILL_MAX_AGE_DAYS`
+   (default 9).
+
+`.github/workflows/backup-freshness.yml` runs it every 6 hours with a
+dedicated identity: SA `rust-api-backup-monitor@…` holding bucket-scoped
+`roles/storage.objectViewer` only, impersonable only by that workflow on
+`refs/heads/main` (binding-condition on the workflow claim). Any GCS error
+is a failed run — a red run IS the alarm. The workflow is gated on the
+repository variable `BACKUP_FRESHNESS_MONITOR_ENABLED`; enabling is part of
+the approved cutover performed by `ops/gce-configure-backup-monitor.sh`
+(dry-run by default, never executed unattended).
+
+Authorized verification performed 2026-10-27 (operator gcloud, read-only):
+heartbeat 2 h old → PASS; forced `BACKUP_MAX_AGE_HOURS=0` → FAIL with exit 1;
+nonexistent bucket → both checks FAIL with exit 1.
 
 ## Restore procedures
 
@@ -145,10 +180,8 @@ with `integrity_check=ok`.
   release assets; do not hard-code a versioned filename in this document —
   verify it when installing), run it as the `rustapi` account under its own
   systemd service, and extend the drill to `litestream restore`.
-- Fold backup freshness into `/health/ready` (or a `/health/backups`
-  endpoint) so staleness is visible through the existing public health
-  surface — deliberately not done now to keep the readiness contract
-  deployment-critical only.
+- Keyless VM identity for backups (no JSON key on disk) — requires a VM
+  stop/start; planned as separate approved maintenance.
 
 ## Execution record (2026-10-26/27)
 

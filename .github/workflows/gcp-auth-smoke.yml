@@ -1,0 +1,42 @@
+name: GCP auth smoke test
+# Read-only verification that GitHub OIDC can obtain the deployer service
+# account through Workload Identity Federation and that the credential can
+# see the production VM. Runs only on manual dispatch, performs no changes,
+# and exists so the hardened WIF condition (ops/gce-harden-github-oidc.sh)
+# can be validated before depending on it for a real deployment:
+#   1. run this from main  -> must succeed
+#   2. run this from a feature branch -> must FAIL once the ref-restricted
+#      condition is applied (that failure is the desired proof)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    # Same environment as the deploy job so any environment-scoped claims
+    # and protection rules apply identically.
+    runs-on: ubuntu-24.04
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Authenticate to Google Cloud with GitHub OIDC
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      - name: Install Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+      - name: Read-only instance probe
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCE_INSTANCE: ${{ vars.GCE_INSTANCE }}
+          GCE_ZONE: ${{ vars.GCE_ZONE }}
+        run: |
+          set -Eeuo pipefail
+          status="$(gcloud compute instances describe "$GCE_INSTANCE" \
+            --project="$GCP_PROJECT_ID" --zone="$GCE_ZONE" \
+            --format='value(status)')"
+          echo "authenticated; $GCE_INSTANCE is $status"
+          test -n "$status"
