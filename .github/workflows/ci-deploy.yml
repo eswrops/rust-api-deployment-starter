@@ -105,12 +105,6 @@ jobs:
             wait "$tunnel_pid" 2>/dev/null || true
           }
           trap cleanup EXIT
-          for _ in $(seq 1 20); do
-            grep -q 'Listening on port' "$tunnel_log" && break
-            kill -0 "$tunnel_pid" 2>/dev/null || { cat "$tunnel_log" >&2; exit 1; }
-            sleep 1
-          done
-          grep -q 'Listening on port' "$tunnel_log" || { cat "$tunnel_log" >&2; exit 1; }
           ssh_options=(
             -i "$key"
             -p "$local_port"
@@ -118,10 +112,14 @@ jobs:
             -o StrictHostKeyChecking=accept-new
             -o UserKnownHostsFile="$RUNNER_TEMP/google_compute_known_hosts"
           )
+          # With IAP's connection preflight disabled, gcloud does not emit a
+          # "Listening on port" message. The authenticated SSH test below is
+          # the readiness check for the tunnel and the VM.
           for _ in $(seq 1 30); do
             if ssh "${ssh_options[@]}" deploy@127.0.0.1 true; then
               break
             fi
+            kill -0 "$tunnel_pid" 2>/dev/null || { cat "$tunnel_log" >&2; exit 1; }
             sleep 2
           done
           ssh "${ssh_options[@]}" deploy@127.0.0.1 true
