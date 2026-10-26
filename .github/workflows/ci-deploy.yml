@@ -96,7 +96,7 @@ jobs:
           gcloud compute start-iap-tunnel "$GCE_INSTANCE" 22 \
             --project="$GCP_PROJECT_ID" \
             --zone="$GCE_ZONE" \
-            --local-host-port="localhost:${local_port}" \
+            --local-host-port="127.0.0.1:${local_port}" \
             --quiet >"$tunnel_log" 2>&1 &
           tunnel_pid=$!
           cleanup() {
