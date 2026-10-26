@@ -85,9 +85,34 @@ jobs:
           # This adds a ten-minute instance metadata key for the restricted
           # deploy user; no private key is stored in GitHub or Google Cloud.
           gcloud compute ssh "deploy@${GCE_INSTANCE}" "${common[@]}" --command=true
-          gcloud compute scp rust-api \
-            "deploy@${GCE_INSTANCE}:/home/deploy/incoming/rust-api-${GITHUB_SHA}" \
-            "${common[@]}"
+          local_port=2222
+          tunnel_log="$RUNNER_TEMP/iap-tunnel.log"
+          gcloud compute start-iap-tunnel "$GCE_INSTANCE" 22 \
+            --project="$GCP_PROJECT_ID" \
+            --zone="$GCE_ZONE" \
+            --local-host-port="localhost:${local_port}" \
+            --quiet >"$tunnel_log" 2>&1 &
+          tunnel_pid=$!
+          cleanup() {
+            kill "$tunnel_pid" 2>/dev/null || true
+            wait "$tunnel_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          for _ in $(seq 1 20); do
+            grep -q 'Listening on port' "$tunnel_log" && break
+            kill -0 "$tunnel_pid" 2>/dev/null || { cat "$tunnel_log" >&2; exit 1; }
+            sleep 1
+          done
+          grep -q 'Listening on port' "$tunnel_log" || { cat "$tunnel_log" >&2; exit 1; }
+          ssh_options=(
+            -i "$key"
+            -p "$local_port"
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=accept-new
+            -o UserKnownHostsFile="$RUNNER_TEMP/google_compute_known_hosts"
+          )
+          scp "${ssh_options[@]}" rust-api \
+            "deploy@127.0.0.1:/home/deploy/incoming/rust-api-${GITHUB_SHA}"
           digest="$(sha256sum rust-api | awk '{print $1}')"
-          gcloud compute ssh "deploy@${GCE_INSTANCE}" "${common[@]}" \
-            --command="sudo /usr/local/sbin/rust-api-activate '${GITHUB_SHA}' '${digest}'"
+          ssh "${ssh_options[@]}" deploy@127.0.0.1 \
+            "sudo /usr/local/sbin/rust-api-activate '${GITHUB_SHA}' '${digest}'"
