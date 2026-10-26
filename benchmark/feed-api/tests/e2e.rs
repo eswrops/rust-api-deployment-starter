@@ -294,6 +294,15 @@ async fn authentication_matrix() {
     let no_name = sign(&json!({"sub":"1","iat":now,"exp":now + 3600}));
     let numeric_sub =
         sign(&json!({"sub":1,"username":"golden_ember_1","iat":now,"exp":now + 3600}));
+    let expired_fractional = sign(
+        &json!({"sub":"1","username":"golden_ember_1","iat":now - 7200,"exp":(now - 3600) as f64 + 0.5}),
+    );
+    let string_exp = sign(&json!({"sub":"1","username":"golden_ember_1","iat":now,"exp":"soon"}));
+    let null_exp = sign(&json!({"sub":"1","username":"golden_ember_1","iat":now,"exp":null}));
+    let bool_exp = sign(&json!({"sub":"1","username":"golden_ember_1","iat":now,"exp":true}));
+    // Valid fractional NumericDate (RFC 7519 §2 allows non-integer values).
+    let fractional_exp =
+        sign(&json!({"sub":"1","username":"golden_ember_1","iat":now,"exp":now as f64 + 3600.5}));
     let none_alg = format!(
         "{}.{}.",
         B64.encode(br#"{"alg":"none","typ":"JWT"}"#),
@@ -340,6 +349,30 @@ async fn authentication_matrix() {
             r#"{"body":"x"}"#,
         ),
         (
+            "expired fractional",
+            Some(&format!("Bearer {expired_fractional}")),
+            "/posts",
+            r#"{"body":"x"}"#,
+        ),
+        (
+            "string exp",
+            Some(&format!("Bearer {string_exp}")),
+            "/posts",
+            r#"{"body":"x"}"#,
+        ),
+        (
+            "null exp",
+            Some(&format!("Bearer {null_exp}")),
+            "/posts",
+            r#"{"body":"x"}"#,
+        ),
+        (
+            "bool exp",
+            Some(&format!("Bearer {bool_exp}")),
+            "/posts",
+            r#"{"body":"x"}"#,
+        ),
+        (
             "sub not integer",
             Some(&format!("Bearer {bad_sub}")),
             "/posts",
@@ -379,6 +412,7 @@ async fn authentication_matrix() {
             || *label == "alg none"
             || *label == "bad signature"
             || label.contains("garbage")
+            || label.contains("exp")
         {
             (401, r#"{"error":"invalid or expired token"}"#)
         } else {
@@ -391,6 +425,16 @@ async fn authentication_matrix() {
             "auth case {label}"
         );
     }
+
+    // A fractional NumericDate must be accepted end to end.
+    let (status, body, _) = server
+        .post(
+            "/posts",
+            Some(&format!("Bearer {fractional_exp}")),
+            Some(r#"{"body":"fractional exp accepted"}"#),
+        )
+        .await;
+    assert_eq!(status, 201, "fractional exp must be accepted: {body}");
 
     // Auth-before-id precedence on the like route.
     let (status, body, _) = server.post("/posts/abc/like", None, None).await;

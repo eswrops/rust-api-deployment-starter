@@ -46,7 +46,9 @@ the fast path; `rows_affected == 0` means the conflict already existed (200); a 
 is missing, disambiguated with one cheap PK lookup (404 vs 500).
 
 **JWT.** Hand-rolled HS256 verification (~80 lines, fully unit-tested): constant-time HMAC check via `hmac::Mac::verify_slice`,
-`alg` must equal `HS256` (so `alg=none` and `HS512` are rejected), `exp` must be present, numeric, and strictly in the future.
+`alg` must equal `HS256` (so `alg=none` and `HS512` are rejected), `exp` must be present, a finite number, and strictly in the
+future — compared with fractional-second precision, per RFC 7519 §2 which allows non-integer NumericDates (integer and
+fractional `exp` both verify; strings, booleans, null and expired values are rejected).
 Structural problems map to `invalid or expired token`; a correctly signed token with a non-integer `sub` or non-string
 `username` maps to `invalid token payload`. Nothing is cached across requests — every authenticated request verifies the signature.
 
@@ -73,13 +75,32 @@ bash test/run.sh path/to/this/folder                # upstream: build + start on
 In-repo regression suite (no seed database needed; uses a deterministic synthetic fixture and the upstream schema verbatim):
 
 ```bash
-cargo test --locked                                 # 7 unit + 11 end-to-end tests
+cargo test --locked                                 # 10 unit + 11 end-to-end tests
 ```
 
 The end-to-end tests cover: byte-exact golden reads, invalid/missing ids, the full auth error matrix (missing/garbage/bad
-signature/`alg=none`/expired/bad payload), auth-before-id precedence, body trimming/Unicode/500-char limit, first-like 201 vs
+signature/`alg=none`/expired (integer and fractional)/string/null/boolean `exp`/bad payload), fractional-`exp` acceptance,
+auth-before-id precedence, body trimming/Unicode/500-char limit, first-like 201 vs
 repeat 200, eight concurrent duplicate likes (exactly one 201), four concurrent distinct-user likes, SIGKILL durability +
 read-after-write on restart, SIGTERM graceful shutdown, and degraded health when the database is unreachable.
+
+Fault-injection and transport-pressure tests (`tests/*.py`, self-contained: each spawns its own server on its own database
+copy — fixture by default, the challenge seed via `SEED_DB=`; CI runs all three):
+
+- `tests/commit_check.sh` (Linux only — GNU ld `--wrap`; refuses elsewhere): builds `bin/commit-test`, the unmodified release
+  binary linked with `tests/commit_fault.c`, which installs a SQLite commit hook controlled by marker files. Proves that a
+  failed `COMMIT` returns 500, rolls back (checked through the API and by reading SQLite directly), consumes the hook's
+  `fail` marker and leaves the server usable — and, by holding the commit inside the hook, that no success response is sent
+  before the commit finishes, with the committed row then visible in SQLite and through the API.
+- `tests/pressure_regression.py`: starts the server with `nofile=256`, holds 160 idle keep-alive connections plus an extra
+  30 to approach the descriptor ceiling, and completes a fragmented upload, 32 write/readback pairs, duplicate likes
+  (201 then idempotent 200, count stays 1), 20 abrupt client disconnects (RST) and a post-disconnect write, then checks
+  keep-alive recovery after the pressure subsides. `EXPECT_RETIREMENT=1` additionally asserts
+  `Connection: close` load-shedding once the server implements it (gated until then).
+- `tests/idle_client.py`: opens `IDLE_COUNT` (default 15,000) idle keep-alive connections, re-verifies every socket, and
+  reports RSS, CPU, descriptor usage, failed attempts and platform — the measured basis for the memory figures in the
+  performance report. CI runs a deterministic subset (3,000); the full 15,000-connection benchmark stays manual
+  (`workflow_dispatch` with `idle_connections: 15000`, or `IDLE_COUNT=15000 python3 tests/idle_client.py`).
 
 ## Performance report
 
@@ -129,8 +150,10 @@ Upstream scoring profile (`bench/load.js`, real user think time, direct connecti
 | 4,000 | 352 | 0.3 | 0.9 | 2.0 | 0.00 % | 12 / 23 | 138 MB |
 
 At 4,000 keep-alive connections the p99 is 2 ms against the 1,000 ms pass threshold — three orders of magnitude of headroom.
-RSS scales with connection count (~13 KB per idle keep-alive socket), projecting to roughly 200 MB at the ~15,000-connection
-direct-connection ceiling, comfortably inside a 2 GB droplet.
+RSS at scale was measured directly with `tests/idle_client.py` (all connections health-checked and re-verified on their
+original sockets): 103 MB at 3,000 idle connections, 492 MB at 15,000 — about 33 KB per idle keep-alive socket plus a small
+fixed base. That puts the ~15,000-connection direct-connection ceiling near 500 MB, still inside a 2 GB droplet but close to
+2.5× the ~13 KB/socket the earlier projection assumed, so capacity planning should use the measured figure.
 
 **Conclusions.**
 
