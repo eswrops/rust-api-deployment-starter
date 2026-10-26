@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Root-owned, invoked through tightly scoped sudoers entry.
+set -Eeuo pipefail
+[[ "${EUID}" -eq 0 ]] || { echo "must be root" >&2; exit 1; }
+sha="${1:-}"
+expected="${2:-}"
+[[ "$sha" =~ ^[[:xdigit:]]{40}$ ]] || { echo "invalid git SHA" >&2; exit 2; }
+[[ "$expected" =~ ^[[:xdigit:]]{64}$ ]] || { echo "invalid digest" >&2; exit 2; }
+source="/home/deploy/incoming/rust-api-${sha}"
+release="/opt/rust-api/releases/${sha}"
+current="/opt/rust-api/current"
+[[ -f "$source" && ! -L "$source" ]] || { echo "missing regular uploaded binary" >&2; exit 3; }
+[[ "$(stat -c '%U' "$source")" == "deploy" ]] || { echo "unexpected upload owner" >&2; exit 3; }
+actual="$(sha256sum "$source" | awk '{print $1}')"
+[[ "$actual" == "$expected" ]] || { echo "checksum mismatch" >&2; exit 3; }
+mkdir -p "$release"
+install -m 0755 -o root -g root "$source" "$release/rust-api"
+previous="$(readlink -f "$current" 2>/dev/null || true)"
+ln -sfn "$release" "/opt/rust-api/.current-next"
+mv -Tf "/opt/rust-api/.current-next" "$current"
+if ! systemctl restart rust-api; then
+  echo "restart failed" >&2
+else
+  for _ in $(seq 1 20); do
+    if curl --fail --silent --show-error --max-time 2 \
+      http://127.0.0.1:8080/health/ready >/dev/null 2>&1; then
+      rm -f "$source"
+      echo "deployed $sha"
+      exit 0
+    fi
+    sleep 1
+  done
+  echo "readiness check failed" >&2
+fi
+if [[ -n "$previous" && -d "$previous" ]]; then
+  echo "rolling back to $previous" >&2
+  ln -sfn "$previous" "/opt/rust-api/.current-next"
+  mv -Tf "/opt/rust-api/.current-next" "$current"
+  systemctl restart rust-api || true
+else
+  echo "no previous release available" >&2
+fi
+exit 1

@@ -1,0 +1,6 @@
+# Optional. Use only once your application actually creates the SQLite file.
+# Litestream 0.5.x-style configuration. Configure credentials securely.
+dbs:
+  - path: /var/lib/rust-api/app.db
+    replica:
+      url: s3://REPLACE_WITH_BUCKET/rust-api

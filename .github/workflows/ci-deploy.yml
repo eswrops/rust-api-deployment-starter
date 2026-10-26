@@ -1,0 +1,76 @@
+name: Rust API CI and Deploy
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.99.1 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Linux AMD64 release
+        run: GIT_SHA="$GITHUB_SHA" cargo build --release --locked
+      - name: Package artifact
+        run: |
+          cp target/release/rust-api rust-api
+          sha256sum rust-api > rust-api.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-api-linux-amd64
+          path: |
+            rust-api
+            rust-api.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: production
+    concurrency:
+      group: rust-api-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rust-api-linux-amd64
+      - name: Configure SSH with pinned host key
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+      - name: Upload and atomically activate
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          test -n "$DEPLOY_HOST"
+          sha256sum --check rust-api.sha256
+          scp -o StrictHostKeyChecking=yes rust-api \
+            "deploy@${DEPLOY_HOST}:/home/deploy/incoming/rust-api-${GITHUB_SHA}"
+          digest="$(sha256sum rust-api | awk '{print $1}')"
+          ssh -o StrictHostKeyChecking=yes "deploy@${DEPLOY_HOST}" \
+            "sudo /usr/local/sbin/rust-api-activate '${GITHUB_SHA}' '${digest}'"
