@@ -5,27 +5,56 @@
 # detects a stale backup even when the VM — and the VM's own alerting — is
 # gone. Read-only: it never writes to the bucket.
 #
+# Talks to the GCS JSON API directly with a bearer access token (the same
+# curl + bearer pattern the VM-side backup tooling uses). `gcloud storage`
+# is avoided on purpose: its CLI preflight fails under some federated
+# credential setups even when the underlying token is fully authorized, and
+# its errors are harder to attribute. Only storage.objects.get/list are
+# needed.
+#
 # Checks (against the private bucket):
 #   1. heartbeat.txt exists and its "backup ok <ISO>" timestamp is fresher
 #      than BACKUP_MAX_AGE_HOURS (default 30: daily timer + one skipped day
 #      of grace).
 #   2. the newest drills/drill-*.txt report is fresher than
 #      DRILL_MAX_AGE_DAYS (default 9: weekly timer + grace).
-# Any GCS access error surfaces as a non-zero exit (a red run IS the alarm).
+# Any GCS access error surfaces as a non-zero exit (a red run IS the alarm)
+# with the HTTP status and response excerpt printed for diagnosis.
 #
 # Environment:
 #   GCS_BUCKET           bucket name (required)
 #   BACKUP_MAX_AGE_HOURS default 30
 #   DRILL_MAX_AGE_DAYS   default 9
+#   GCS_API_BASE         default https://storage.googleapis.com (tests)
 set -Eeuo pipefail
 
 bucket="${GCS_BUCKET:?GCS_BUCKET must be set}"
 max_backup_hours="${BACKUP_MAX_AGE_HOURS:-30}"
 max_drill_days="${DRILL_MAX_AGE_DAYS:-9}"
+api="${GCS_API_BASE:-https://storage.googleapis.com}/storage/v1/b/${bucket}"
 failures=0
 
 note() { echo "freshness: $*"; }
 fail() { echo "freshness: FAIL: $*" >&2; failures=$((failures + 1)); }
+
+token="$(gcloud auth print-access-token 2>&1)" || {
+  echo "freshness: cannot obtain an access token: $token" >&2
+  exit 1
+}
+if [[ "$token" != ya29.* ]]; then
+  echo "freshness: unexpected access token (not an SA token): $(head -c 80 <<<"$token")" >&2
+  exit 1
+fi
+
+body="$(mktemp)"
+trap 'rm -f "$body"' EXIT
+
+# gcs_get PATH_QUERY -> HTTP status on stdout, response body left in $body
+gcs_get() {
+  curl -sS --max-time 30 -o "$body" -w '%{http_code}' \
+    -H "Authorization: Bearer $token" "${api}${1}" || { echo "network"; return 1; }
+}
+show_body() { echo "freshness: response: $(head -c 200 "$body")" >&2; }
 
 # iso_age_seconds TIMESTAMP -> age in seconds (python3: portable date math)
 iso_age_seconds() {
@@ -37,13 +66,14 @@ PY
 }
 
 # 1. Heartbeat: proves a recent successful snapshot + off-site upload.
-if ! heartbeat="$(gcloud storage cat "gs://${bucket}/heartbeat.txt" 2>&1)"; then
-  fail "cannot read gs://${bucket}/heartbeat.txt (missing heartbeat = backup pipeline broken or VM lost)"
-  gcloud storage cat "gs://${bucket}/heartbeat.txt" >/dev/null 2>&1 || true
+code="$(gcs_get "/o/heartbeat.txt?alt=media")" || code="network"
+if [ "$code" != "200" ]; then
+  [ "$code" != "network" ] && show_body
+  fail "heartbeat read returned HTTP $code (missing heartbeat = backup pipeline broken or VM lost)"
 else
-  ts="$(sed -n 's/^backup ok \([0-9T:-]*Z\)$/\1/p' <<<"$heartbeat" | tail -1)"
+  ts="$(sed -n 's/^backup ok \([0-9T:-]*Z\)$/\1/p' "$body" | tail -1)"
   if [ -z "$ts" ]; then
-    fail "heartbeat present but no 'backup ok <ISO>' line: $(head -1 <<<"$heartbeat")"
+    fail "heartbeat present but no 'backup ok <ISO>' line: $(head -1 "$body")"
   else
     age="$(iso_age_seconds "$ts")"
     if [ "$age" -gt "$((max_backup_hours * 3600))" ]; then
@@ -54,18 +84,25 @@ else
   fi
 fi
 
-# 2. Restore drill: proves the off-site copies actually restore.
-drills="$(gcloud storage ls "gs://${bucket}/drills/*" 2>/dev/null | grep -oE 'drill-[0-9T]+Z\.txt$' | sort | tail -1 || true)"
-if [ -z "$drills" ]; then
-  fail "no drill reports under gs://${bucket}/drills/ — weekly restore drill has never succeeded"
+# 2. Restore drill: proves the off-site copies actually restore. Objects
+#    return in name order, so the newest report is the last drills/ item.
+code="$(gcs_get "/o?prefix=drills/&fields=items(name)&maxResults=999")" || code="network"
+if [ "$code" != "200" ]; then
+  [ "$code" != "network" ] && show_body
+  fail "drill listing returned HTTP $code"
 else
-  stamp="${drills#drill-}"; stamp="${stamp%.txt}"
-  ts="${stamp:0:4}-${stamp:4:2}-${stamp:6:2}T${stamp:9:2}:${stamp:11:2}:${stamp:13:2}Z"
-  age_days=$(( $(iso_age_seconds "$ts") / 86400 ))
-  if [ "$age_days" -gt "$max_drill_days" ]; then
-    fail "last restore drill is ${age_days}d old (limit ${max_drill_days}d): $drills"
+  newest="$(jq -r '.items[]?.name // empty' "$body" | grep -E '^drills/drill-[0-9T]+Z\.txt$' | sort | tail -1)"
+  if [ -z "$newest" ]; then
+    fail "no drill reports under gs://${bucket}/drills/ — weekly restore drill has never succeeded"
   else
-    note "drill ok: last report ${age_days}d ago ($drills)"
+    stamp="${newest#drills/drill-}"; stamp="${stamp%.txt}"
+    ts="${stamp:0:4}-${stamp:4:2}-${stamp:6:2}T${stamp:9:2}:${stamp:11:2}:${stamp:13:2}Z"
+    age_days=$(( $(iso_age_seconds "$ts") / 86400 ))
+    if [ "$age_days" -gt "$max_drill_days" ]; then
+      fail "last restore drill is ${age_days}d old (limit ${max_drill_days}d): $newest"
+    else
+      note "drill ok: last report ${age_days}d ago ($newest)"
+    fi
   fi
 fi
 
