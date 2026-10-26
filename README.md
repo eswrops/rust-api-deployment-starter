@@ -2,6 +2,42 @@
 
 **Baseline:** Rust 1.99.1, Axum 0.8, Ubuntu 24.04 AMD64, one public VPS, native binary, systemd, Caddy, GitHub Actions. This is a deployment starter, not a finished authenticated product. The provided readiness endpoint is a stub until you add database and upstream health checks.
 
+## Google Cloud Always Free (`gcloud`)
+
+This repository includes a deliberately small Google Compute Engine route for
+`rust-product-foundry-4bd846`: one `e2-micro` in `us-west1-b`, a 30 GB standard
+persistent disk, IAP-only SSH, and an external IPv6 address. It intentionally
+has **no external IPv4 address**, so `api-bench.thetechs.top` is reachable only
+by IPv6-capable clients. This avoids the hourly IPv4 fee, but does not make
+usage unconditionally free: stay within the Google Cloud Free Tier VM and
+egress limits.
+
+Run the idempotent provisioner from this repository with an authenticated
+project owner:
+
+```bash
+./ops/gce-provision.sh
+```
+
+It prints the IPv6 value for a DNS-only Cloudflare AAAA record. Publish that
+record for `api-bench.thetechs.top`, wait for it to resolve, then start Caddy:
+
+```bash
+./ops/gce-enable-caddy.sh
+```
+
+GitHub Actions deploys through Google Workload Identity Federation and IAP, so
+it has no deployment SSH private key or host-key secret. Configure it once with:
+
+```bash
+./ops/gce-configure-github-oidc.sh
+```
+
+The script creates the `production` environment and the required non-secret
+repository variables through `gh`. A deployment generates an SSH key that
+expires after ten minutes, uses it only through IAP as the restricted `deploy`
+user, and then calls the existing atomic activation script.
+
 ## 1. Local development
 
 Install rustup using the official instructions (https://rustup.rs). From this directory:
