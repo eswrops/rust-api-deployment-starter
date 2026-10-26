@@ -7,33 +7,125 @@ on:
 permissions:
   contents: read
   id-token: write
+
+# Third-party actions are pinned to reviewed full commit SHAs (the tag each
+# SHA resolves to is noted next to it). Update pins deliberately.
+env:
+  RUST_VERSION: "1.99.1"
+  UPSTREAM_CHALLENGE_REF: "16fb03ebee64ea62ec7b90f0afcfe199afc4f56a"
+
 jobs:
+  # Production releases/deployments are only rebuilt when something that
+  # affects the deployed binary changed; benchmark-only or docs-only pushes
+  # skip the release build and deployment entirely.
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      deploy: ${{ steps.filter.outputs.deploy }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "pull_request" ]; then
+            files="$(git diff --name-only "origin/${BASE_REF}...HEAD")"
+          elif git rev-parse -q --verify 'HEAD^' >/dev/null 2>&1; then
+            files="$(git diff --name-only 'HEAD^' HEAD)"
+          else
+            # First commit on the branch: deploy.
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed files:"; echo "$files"
+          if echo "$files" | grep -qE '^(src/|migrations/|config/|ops/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|Dockerfile$|\.github/workflows/ci-deploy\.yml$)'; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+
   verify:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned Rust
-        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
-      - uses: Swatinem/rust-cache@v2
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt,clippy
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - name: Validate migrations
+        run: cargo test --locked --test migrations
 
-  build:
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-    needs: verify
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Check out upstream challenge at pinned revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: arjaythedev/twelve-dollar-server-challenge
+          ref: ${{ env.UPSTREAM_CHALLENGE_REF }}
+          path: upstream
+      - name: Install pinned Rust
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt,clippy
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          workspaces: benchmark/feed-api
+      - name: Format
+        run: cargo fmt --manifest-path benchmark/feed-api/Cargo.toml --all -- --check
+      - name: Clippy
+        run: cargo clippy --manifest-path benchmark/feed-api/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Regression tests
+        run: cargo test --manifest-path benchmark/feed-api/Cargo.toml --locked
+      - name: Install sqlite3 CLI if missing
+        run: |
+          if ! command -v sqlite3 >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3
+          fi
+      - name: Build seed database (50k users / 500k posts / 2M likes)
+        run: bash upstream/seed/make-seed.sh
+      - name: Upstream test suite (42 checks on a fresh database copy)
+        run: bash upstream/test/run.sh benchmark/feed-api
+
+  security:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install 1.99.1 --profile minimal
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: cargo-deny (production crate)
+        uses: embarkstudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
+        with:
+          command: check
+          manifest-path: ./Cargo.toml
+      - name: cargo-deny (benchmark crate)
+        uses: embarkstudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
+        with:
+          command: check
+          manifest-path: benchmark/feed-api/Cargo.toml
+
+  build:
+    if: >-
+      github.event_name != 'pull_request' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' || needs.changes.outputs.deploy == 'true')
+    needs: [changes, verify, benchmark, security]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup toolchain install "$RUST_VERSION" --profile minimal
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
       - name: Build Linux AMD64 release
         run: GIT_SHA="$GITHUB_SHA" cargo build --release --locked
       - name: Package artifact
         run: |
           cp target/release/rust-api rust-api
           sha256sum rust-api > rust-api.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rust-api-linux-amd64
           path: |
@@ -43,7 +135,16 @@ jobs:
           retention-days: 7
 
   deploy:
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    # Production gate: deploys only when the repository variable
+    # PRODUCTION_DEPLOY_ENABLED is exactly "true" (set with
+    # `gh variable set PRODUCTION_DEPLOY_ENABLED --body true`, delete or set
+    # to any other value to disable). Absent variable = deploys disabled.
+    # Everything upstream of this job (verify, benchmark, security, release
+    # build) runs and produces the artifact regardless of the gate.
+    if: >-
+      github.event_name != 'pull_request' &&
+      github.ref == 'refs/heads/main' &&
+      vars.PRODUCTION_DEPLOY_ENABLED == 'true'
     needs: build
     runs-on: ubuntu-24.04
     environment: production
@@ -51,16 +152,16 @@ jobs:
       group: rust-api-production
       cancel-in-progress: false
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: rust-api-linux-amd64
       - name: Authenticate to Google Cloud with GitHub OIDC
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
         with:
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
       - name: Install Google Cloud CLI
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
       - name: Upload through IAP and atomically activate
         env:
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}

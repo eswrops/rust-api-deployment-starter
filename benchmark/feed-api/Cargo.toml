@@ -1,0 +1,38 @@
+[package]
+name = "feed-api"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Twelve-dollar-server-challenge feed API: Axum + SQLx + SQLite benchmark implementation"
+
+# Standalone package: never joins a parent workspace.
+[workspace]
+
+# Exact pins (upstream rule 10). Cargo.lock is committed; build.sh uses --locked.
+[dependencies]
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "json"] }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "net", "macros", "signal", "time"] }
+sqlx = { version = "=0.8.6", default-features = false, features = ["runtime-tokio", "sqlite"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+hmac = "=0.12.1"
+sha2 = "=0.10.9"
+base64 = "=0.22.1"
+tower-http = { version = "=0.6.11", default-features = false, features = ["trace"] }
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+reqwest = { version = "=0.12.28", default-features = false, features = ["json"] }
+tempfile = "=3.27.0"
+# Integration tests spawn and signal the server binary.
+tokio = { version = "=1.54.1", features = ["process", "sync"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+incremental = false
+strip = true
+panic = "unwind"

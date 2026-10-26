@@ -1,6 +1,6 @@
 # Rust API starter: minimal-cost VPS with reproducible GitHub CI deployments
 
-**Baseline:** Rust 1.99.1, Axum 0.8, Ubuntu 24.04 AMD64, one public VPS, native binary, systemd, Caddy, GitHub Actions. This is a deployment starter, not a finished authenticated product. The provided readiness endpoint is a stub until you add database and upstream health checks.
+**Baseline:** Rust 1.99.1, Axum 0.8, SQLite (SQLx), Ubuntu 24.04 AMD64, one public VPS, native binary, systemd, Caddy, GitHub Actions. The production service integrates SQLite (`src/db.rs`: one writer connection + a two-connection reader pool, WAL, `synchronous=FULL`) with versioned SQL migrations in `migrations/` and a real database-backed `/health/ready`. The $12-server-challenge feed API lives as an independent crate in [`benchmark/feed-api/`](benchmark/feed-api/README.md); it is not deployed to production.
 
 ## Google Cloud Always Free (`gcloud`)
 
@@ -47,8 +47,9 @@ cargo generate-lockfile
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo run
-curl -fsS http://127.0.0.1:8080/health/live
+cargo run -- migrate                # create + migrate the dev database (DATABASE_URL, default sqlite:///var/lib/rust-api/app.db)
+DATABASE_URL=sqlite://dev.db cargo run
+curl -fsS http://127.0.0.1:8080/health/ready
 ```
 
 **Commit `Cargo.lock`** before CI (`--locked` deliberately fails without it). Do not commit `.env`, databases, keys, or build artifacts. The Rust toolchain is pinned in `rust-toolchain.toml`. `APP_BIND` defaults to `127.0.0.1:8080`.
@@ -125,9 +126,13 @@ Push this repository to GitHub, with `Cargo.lock` committed. Create a GitHub Env
 
 Generate the deployment key locally with `ssh-keygen -t ed25519 -f ~/.ssh/rust-api-deploy -C 'rust-api CI deploy'`. Install its `.pub` content in the `deploy` user's `authorized_keys`; put its private half ONLY in the GitHub secret. Verify the host key fingerprint using the VPS console or an established trusted SSH session before adding it to `DEPLOY_KNOWN_HOSTS`. Never blindly trust a `ssh-keyscan` result without verifying its fingerprint.
 
-Commit and push to `main`. The workflow checks formatting, Clippy and tests, builds the AMD64 release on Ubuntu 24.04, saves a short-lived artifact, uploads it to a restricted `/home/deploy/incoming` directory, and calls a root-owned activation script that checks the digest, updates the symlink and restarts the service. It tries the readiness endpoint and restores the previous symlink if the new process fails health checks.
+Commit and push to `main`. The workflow runs five independent checks — formatting, Clippy, tests (including explicit migration validation), the benchmark contract suite (builds the upstream seed database and runs the 42-check challenge suite against `benchmark/feed-api/`), and cargo-deny for dependency advisories and licenses — then builds the AMD64 release on Ubuntu 24.04, saves a short-lived artifact, uploads it to a restricted `/home/deploy/incoming` directory, and calls a root-owned activation script that checks the digest, updates the symlink and restarts the service. It tries the readiness endpoint and restores the previous symlink if the new process fails health checks.
 
-The workflow uses version tags for third-party actions for readability. In a hardened environment, replace tags with **reviewed immutable full commit SHAs**, periodically updating them. Limit who can edit deployment workflows, and prefer environment approvals.
+Release builds and deployments are triggered only by pushes that touch production-relevant paths (`src/`, `migrations/`, `config/`, `ops/`, manifests, the workflow itself); benchmark-only or documentation-only pushes skip the release build. Manual `workflow_dispatch` always builds and deploys. Third-party actions are pinned to reviewed full commit SHAs (the resolved tag is noted in a comment beside each pin); re-review the pins when you update them. Limit who can edit deployment workflows, and prefer environment approvals.
+
+## 7b. Feed API benchmark ($12 Server Challenge)
+
+`benchmark/feed-api/` is a standalone, independently buildable crate that implements the challenge's five-endpoint feed API (Axum + SQLx + SQLite, its own `SQLITE_PATH`/`JWT_SECRET` configuration, its own regression suite and CI job). It shares no code or configuration with the production service — the benchmark database and benchmark JWT secret never touch the live API. See [`benchmark/feed-api/README.md`](benchmark/feed-api/README.md) for the design, performance measurements and run instructions.
 
 ## 6. Inspect and troubleshoot
 
@@ -143,20 +148,33 @@ sudo du -sh /opt/rust-api/releases
 
 No binary is installed until the first successful deploy, so `rust-api.service` cannot start yet on initial boot. The activation script starts it on first deploy.
 
-## 7. SQLite application integration (next stage)
+## 7. SQLite integration (implemented)
 
-The sample deliberately does **not** pretend to include a finished database. When adding SQLx SQLite:
+The production service uses SQLite as its only database:
 
-1. Create `sqlite:///var/lib/rust-api/app.db` on **local persistent disk**, not NFS or a temporary container directory.
-2. Establish the writer first, set `PRAGMA journal_mode=WAL`, `synchronous=FULL` for important data, `foreign_keys=ON`, and a measured `busy_timeout`.
-3. Use **one writer connection** and a separate, small read pool (initially 2–4 connections).
-4. Keep transactions short. Bound the concurrent work queue with semaphores/channels; do not create unbounded `tokio::spawn` tasks per incoming job.
-5. Put explicit, version-controlled forward SQL migrations under `migrations/`. Test them against a restored staging copy.
-6. Before a schema-changing deployment: verify backup, run a dedicated migration action, then activate the binary. Prefer expand/contract migrations. Binary rollback does not automatically roll back the schema.
-7. Replace the stub `/health/ready` with an actual lightweight DB health query and return 503 when dependencies cannot serve traffic.
-8. Add Litestream v0.5.x replication using `config/litestream.yml.example` as a starting point. Configure private object storage credentials, alerts, and periodic **restore tests**. A local volume or VPS snapshot alone is not a complete off-site backup.
+- **Location:** `/var/lib/rust-api/app.db` (systemd `StateDirectory=rust-api`; persistent local disk, not NFS). Override with `DATABASE_URL` (`sqlite:///absolute/path`, configured in `/etc/rust-api/app.env`).
+- **Pools:** exactly one write connection (all mutations serialize through it, eliminating writer/writer `SQLITE_BUSY`) plus a two-connection reader pool (`DbConfig::read_connections`). Connections are warm and created lazily, so the process boots even when the database file is broken and `/health/live` keeps answering.
+- **Pragmas:** `journal_mode=WAL`, `foreign_keys=ON`, `busy_timeout=5s`, `synchronous=FULL` (a committed write survives power loss before the caller is told it succeeded).
+- **Migrations:** versioned, forward-only SQL in `migrations/`, embedded into the binary at compile time. They are applied **only** by the explicit `rust-api migrate` command (run as `rustapi` on the VM) — never at server startup or per request.
+- **Health:** `/health/ready` executes `SELECT 1` against the reader pool → `200 {"status":"ok",…}` or `503 {"status":"degraded","error":…}`. `/health/live` never touches the database.
+- **Backup/recovery:** see [docs/backup-recovery.md](docs/backup-recovery.md) (Litestream continuous replication + nightly `.backup` snapshots, with a restore-drill procedure).
 
-See: https://www.sqlite.org/wal.html , https://litestream.io/reference/config/
+### Deploying schema changes
+
+Keep migrations expand/contract so a binary rollback never faces an incompatible schema. The sequence for a schema-touching release:
+
+1. Ship the new migration in `migrations/` (never edit an applied one).
+2. After the artifact is on the VM (and before traffic depends on the new schema), run:
+   `sudo -u rustapi env DATABASE_URL=sqlite:///var/lib/rust-api/app.db /opt/rust-api/current/rust-api migrate`
+3. Activate/restart the service.
+
+**One-time bootstrap required for the first deploy of the SQLite-enabled binary:** `/health/ready` now fails (503) while the database file does not exist, and the activation script rolls the release back to the previous binary when readiness fails — by design, so the service never serves from a broken database. The production deploy job is additionally gated on the repository variable `PRODUCTION_DEPLOY_ENABLED` (disabled by default; see [docs/first-sqlite-deployment.md](docs/first-sqlite-deployment.md)). The bootstrap procedure is:
+
+1. Push the release commit; CI runs verify/benchmark/security/build and uploads the artifact (deploy stays gated off).
+2. Download the artifact and run the idempotent `ops/first-sqlite-deploy.sh --git-sha <sha> --artifact-dir <dir>`: it stages the exact CI artifact, creates `/var/lib/rust-api` with correct ownership on persistent disk, runs the embedded migrations as `rustapi` with the production `DATABASE_URL`, proves migration idempotency, and rehearses readiness with the staged binary — all without touching the running service.
+3. Enable the gate (`gh variable set PRODUCTION_DEPLOY_ENABLED --body true`) and dispatch the workflow; the deploy job activates the release through the existing OIDC/IAP path with its readiness-gated, auto-rollback activation.
+
+This is the only production database configuration change in this iteration; it is documented here per the project constraint that production changes must be explicit.
 
 ## 8. Optional OCI deployment
 
