@@ -123,10 +123,17 @@ if ! gcloud iam service-accounts describe "$monitor_sa" --project="$project_id" 
 fi
 wait_for_service_account "$monitor_sa"
 
-# Read-only, bucket-scoped: can list/read this bucket and nothing else.
+# Read-only, bucket-scoped: object reads/listing plus bucket metadata.
+# objectViewer alone is not enough: gcloud storage resolves objects through
+# a bucket metadata lookup that requires storage.buckets.get, which
+# objectViewer deliberately does not include — hence the separate
+# bucketViewer grant. Both are read-only and bound at this bucket only.
 retry gcloud storage buckets add-iam-policy-binding "gs://${bucket}" \
   --member="serviceAccount:${monitor_sa}" \
   --role=roles/storage.objectViewer
+retry gcloud storage buckets add-iam-policy-binding "gs://${bucket}" \
+  --member="serviceAccount:${monitor_sa}" \
+  --role=roles/storage.bucketViewer
 
 # Impersonation restricted to identities whose computed scope is 'granted':
 # only backup-freshness.yml running on refs/heads/main.
@@ -147,5 +154,6 @@ echo "  2. subscribe to failure notifications for the workflow (or add a chat we
 echo
 echo "Rollback: gh variable delete BACKUP_FRESHNESS_MONITOR_ENABLED --repo=${repository}"
 echo "  gcloud storage buckets remove-iam-policy-binding gs://${bucket} --member=serviceAccount:${monitor_sa} --role=roles/storage.objectViewer"
+echo "  gcloud storage buckets remove-iam-policy-binding gs://${bucket} --member=serviceAccount:${monitor_sa} --role=roles/storage.bucketViewer"
 echo "  gcloud iam service-accounts remove-iam-policy-binding ${monitor_sa} --member='${principal_set}' --role=roles/iam.workloadIdentityUser"
 echo "  # and remove attribute.monitor_scope from the provider mapping"
