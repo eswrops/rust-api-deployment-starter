@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  id-token: write
 jobs:
   verify:
     runs-on: ubuntu-24.04
@@ -53,24 +54,40 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: rust-api-linux-amd64
-      - name: Configure SSH with pinned host key
+      - name: Authenticate to Google Cloud with GitHub OIDC
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      - name: Install Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+      - name: Upload through IAP and atomically activate
         env:
-          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCE_INSTANCE: ${{ vars.GCE_INSTANCE }}
+          GCE_ZONE: ${{ vars.GCE_ZONE }}
         run: |
-          install -d -m 0700 ~/.ssh
-          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
-      - name: Upload and atomically activate
-        env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-        run: |
-          test -n "$DEPLOY_HOST"
+          set -Eeuo pipefail
+          test -n "$GCP_PROJECT_ID"
+          test -n "$GCE_INSTANCE"
+          test -n "$GCE_ZONE"
           sha256sum --check rust-api.sha256
-          scp -o StrictHostKeyChecking=yes rust-api \
-            "deploy@${DEPLOY_HOST}:/home/deploy/incoming/rust-api-${GITHUB_SHA}"
+          key="$RUNNER_TEMP/rust-api-deploy"
+          ssh-keygen -q -t ed25519 -N '' -f "$key"
+          common=(
+            --project="$GCP_PROJECT_ID"
+            --zone="$GCE_ZONE"
+            --tunnel-through-iap
+            --ssh-key-file="$key"
+            --ssh-key-expire-after=10m
+            --quiet
+          )
+          # This adds a ten-minute instance metadata key for the restricted
+          # deploy user; no private key is stored in GitHub or Google Cloud.
+          gcloud compute ssh "deploy@${GCE_INSTANCE}" "${common[@]}" --command=true
+          gcloud compute scp rust-api \
+            "deploy@${GCE_INSTANCE}:/home/deploy/incoming/rust-api-${GITHUB_SHA}" \
+            "${common[@]}"
           digest="$(sha256sum rust-api | awk '{print $1}')"
-          ssh -o StrictHostKeyChecking=yes "deploy@${DEPLOY_HOST}" \
-            "sudo /usr/local/sbin/rust-api-activate '${GITHUB_SHA}' '${digest}'"
+          gcloud compute ssh "deploy@${GCE_INSTANCE}" "${common[@]}" \
+            --command="sudo /usr/local/sbin/rust-api-activate '${GITHUB_SHA}' '${digest}'"
