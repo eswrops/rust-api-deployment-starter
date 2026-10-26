@@ -12,10 +12,13 @@ pool=github-actions-pool
 provider=github-actions-provider
 service_account_name=github-rust-api-deployer
 service_account="${service_account_name}@${project_id}.iam.gserviceaccount.com"
-role_id=rustApiInstanceDeployer
-role_name="projects/${project_id}/roles/${role_id}"
+instance_role_id=rustApiInstanceDeployer
+instance_role_name="projects/${project_id}/roles/${instance_role_id}"
+project_role_id=rustApiDeploymentProjectAccess
+project_role_name="projects/${project_id}/roles/${project_role_id}"
 provider_resource="projects/${project_number}/locations/global/workloadIdentityPools/${pool}/providers/${provider}"
-permissions='compute.instances.get,compute.instances.list,compute.instances.setMetadata,compute.projects.get,compute.globalOperations.get,compute.zoneOperations.get'
+instance_permissions='compute.instances.get,compute.instances.list,compute.instances.setMetadata'
+project_permissions='compute.projects.get,compute.globalOperations.get,compute.zoneOperations.get'
 
 exists() {
   "$@" >/dev/null 2>&1
@@ -27,12 +30,20 @@ if ! exists gcloud iam service-accounts describe "$service_account" --project="$
     --display-name='GitHub Rust API deployer'
 fi
 
-if exists gcloud iam roles describe "$role_id" --project="$project_id"; then
-  gcloud iam roles update "$role_id" --project="$project_id" \
-    --title='Rust API instance deployer' --stage=GA --permissions="$permissions"
+if exists gcloud iam roles describe "$instance_role_id" --project="$project_id"; then
+  gcloud iam roles update "$instance_role_id" --project="$project_id" \
+    --title='Rust API instance deployer' --stage=GA --permissions="$instance_permissions"
 else
-  gcloud iam roles create "$role_id" --project="$project_id" \
-    --title='Rust API instance deployer' --stage=GA --permissions="$permissions"
+  gcloud iam roles create "$instance_role_id" --project="$project_id" \
+    --title='Rust API instance deployer' --stage=GA --permissions="$instance_permissions"
+fi
+
+if exists gcloud iam roles describe "$project_role_id" --project="$project_id"; then
+  gcloud iam roles update "$project_role_id" --project="$project_id" \
+    --title='Rust API deploy project access' --stage=GA --permissions="$project_permissions"
+else
+  gcloud iam roles create "$project_role_id" --project="$project_id" \
+    --title='Rust API deploy project access' --stage=GA --permissions="$project_permissions"
 fi
 
 if ! exists gcloud iam workload-identity-pools describe "$pool" --location=global --project="$project_id"; then
@@ -57,8 +68,10 @@ gcloud iam service-accounts add-iam-policy-binding "$service_account" --project=
   --member="$principal_set" --role=roles/iam.workloadIdentityUser
 gcloud projects add-iam-policy-binding "$project_id" \
   --member="serviceAccount:${service_account}" --role=roles/iap.tunnelResourceAccessor
+gcloud projects add-iam-policy-binding "$project_id" \
+  --member="serviceAccount:${service_account}" --role="$project_role_name"
 gcloud compute instances add-iam-policy-binding "$instance" --zone="$zone" --project="$project_id" \
-  --member="serviceAccount:${service_account}" --role="$role_name"
+  --member="serviceAccount:${service_account}" --role="$instance_role_name"
 
 gh api --method PUT "repos/${repository}/environments/production" >/dev/null
 gh variable set GCP_PROJECT_ID --repo="$repository" --body="$project_id"
