@@ -3,7 +3,10 @@
 //! Spec rules implemented here:
 //! - only `Authorization: Bearer <jwt>` counts; anything else is `missing bearer token`
 //! - only HS256 is accepted; a bad signature, a non-HS256 `alg`, a structurally broken
-//!   JWT or a missing/expired `exp` all map to `invalid or expired token`
+//!   JWT or a missing/invalid/expired `exp` all map to `invalid or expired token`
+//! - `exp` is an RFC 7519 NumericDate: any finite JSON number, integer or
+//!   fractional, compared against current Unix time with fractional-second
+//!   precision
 //! - a correctly signed token whose payload has a `sub` that is not a positive integer
 //!   string or a `username` that is not a string maps to `invalid token payload`
 //! - every authenticated request verifies the signature: no verification is remembered
@@ -59,16 +62,21 @@ fn verify(token: &str, secret: &[u8]) -> Result<Claims, ApiError> {
     let payload = URL_SAFE_NO_PAD.decode(payload64).map_err(|_| invalid())?;
     let claims: Value = serde_json::from_slice(&payload).map_err(|_| invalid())?;
 
-    // `exp` must be present and numeric; the token is only valid strictly before it.
+    // `exp` must be present and a finite number (RFC 7519 §2 NumericDate:
+    // "non-integer values can be represented"); the token is only valid
+    // strictly before it.
     let exp = claims
         .get("exp")
-        .and_then(Value::as_i64)
+        .and_then(Value::as_f64)
         .ok_or_else(invalid)?;
+    if !exp.is_finite() {
+        return Err(invalid());
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if now >= exp.max(0) as u64 {
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    if now >= exp {
         return Err(invalid());
     }
 
@@ -215,6 +223,61 @@ mod tests {
             verify_str(&token(&json!({"sub":"1","username":"u","exp":"soon"}))).unwrap_err(),
             ApiError::InvalidToken
         );
+    }
+
+    #[test]
+    fn accepts_fractional_numeric_dates() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        // RFC 7519 §2: "non-integer values can be represented".
+        let fractional = json!({"sub":"1","username":"u","exp": now as f64 + 3600.5});
+        assert_eq!(verify_str(&token(&fractional)).unwrap().user_id, 1);
+        // A float that happens to be integral is equally valid.
+        let integral_float = json!({"sub":"2","username":"u","exp": (now + 3600) as f64});
+        assert_eq!(verify_str(&token(&integral_float)).unwrap().user_id, 2);
+        // Valid only for a fraction of a second past the next whole second
+        // (`now` is floored, so at least 1.5 s remain): the fractional part is
+        // what makes this token verifiable — as_i64 would reject it.
+        let barely = json!({"sub":"3","username":"u","exp": now as f64 + 2.5});
+        assert_eq!(verify_str(&token(&barely)).unwrap().user_id, 3);
+    }
+
+    #[test]
+    fn rejects_expired_fractional_exp() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        // Half a second in the past cannot become valid by scheduling delay.
+        let payload = json!({"sub":"1","username":"u","exp": now as f64 - 0.5});
+        assert_eq!(
+            verify_str(&token(&payload)).unwrap_err(),
+            ApiError::InvalidToken
+        );
+    }
+
+    #[test]
+    fn rejects_non_numeric_exp_types() {
+        for exp in [
+            Value::Null,
+            json!(true),
+            json!(false),
+            json!(["soon"]),
+            json!({"t":1}),
+        ] {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let mut payload = json!({"sub":"1","username":"u","iat":now});
+            payload.as_object_mut().unwrap().insert("exp".into(), exp);
+            assert_eq!(
+                verify_str(&token(&payload)).unwrap_err(),
+                ApiError::InvalidToken
+            );
+        }
     }
 
     #[test]

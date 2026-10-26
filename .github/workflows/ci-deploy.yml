@@ -4,6 +4,13 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      # Full manual memory benchmark: run this workflow with 15000. CI runs a
+      # smaller deterministic count; the 15k run is never a deploy gate.
+      idle_connections:
+        description: "Idle keep-alive connections for the memory benchmark"
+        default: "3000"
+        type: string
 permissions:
   contents: read
   id-token: write
@@ -87,15 +94,34 @@ jobs:
         run: cargo clippy --manifest-path benchmark/feed-api/Cargo.toml --all-targets --locked -- -D warnings
       - name: Regression tests
         run: cargo test --manifest-path benchmark/feed-api/Cargo.toml --locked
-      - name: Install sqlite3 CLI if missing
+      - name: Install sqlite3 CLI and dev header if missing
         run: |
-          if ! command -v sqlite3 >/dev/null 2>&1; then
-            sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3
+          missing=()
+          command -v sqlite3 >/dev/null 2>&1 || missing+=(sqlite3)
+          [ -f /usr/include/sqlite3.h ] || missing+=(libsqlite3-dev)
+          if [ ${#missing[@]} -gt 0 ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq "${missing[@]}"
           fi
       - name: Build seed database (50k users / 500k posts / 2M likes)
         run: bash upstream/seed/make-seed.sh
       - name: Upstream test suite (42 checks on a fresh database copy)
         run: bash upstream/test/run.sh benchmark/feed-api
+      # Fault-injection and transport-pressure tests (tests/*.py). They reuse
+      # the seed built above and the bin/server produced by run.sh's build.
+      - name: Commit-failure fault injection (unmodified binary, GNU ld --wrap shim)
+        run: bash benchmark/feed-api/tests/commit_check.sh
+        env:
+          SEED_DB: ${{ github.workspace }}/upstream/seed/feed.db
+          SQLITE3_INCLUDE_DIR: /usr/include
+      - name: Connection pressure regression (server under nofile=256)
+        run: python3 benchmark/feed-api/tests/pressure_regression.py
+        env:
+          SEED_DB: ${{ github.workspace }}/upstream/seed/feed.db
+      - name: Idle keep-alive capacity (deterministic subset, RSS measurement)
+        run: python3 benchmark/feed-api/tests/idle_client.py
+        env:
+          SEED_DB: ${{ github.workspace }}/upstream/seed/feed.db
+          IDLE_COUNT: ${{ inputs.idle_connections || '3000' }}
 
   security:
     runs-on: ubuntu-24.04
