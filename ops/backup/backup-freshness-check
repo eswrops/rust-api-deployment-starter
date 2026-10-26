@@ -37,10 +37,19 @@ failures=0
 note() { echo "freshness: $*"; }
 fail() { echo "freshness: FAIL: $*" >&2; failures=$((failures + 1)); }
 
-token="$(gcloud auth print-access-token 2>&1)" || {
-  echo "freshness: cannot obtain an access token: $token" >&2
-  exit 1
-}
+# Token precedence: GCS_ACCESS_TOKEN env (CI passes the WIF-federated
+# access token from the auth step's output — `gcloud auth print-access-
+# token` cannot mint SA tokens on the iamcredentials path without
+# serviceAccountTokenCreator), falling back to the local gcloud identity
+# (operator workstation use).
+if [ -n "${GCS_ACCESS_TOKEN:-}" ]; then
+  token="$GCS_ACCESS_TOKEN"
+else
+  token="$(gcloud auth print-access-token 2>&1)" || {
+    echo "freshness: cannot obtain an access token: $token" >&2
+    exit 1
+  }
+fi
 if [[ "$token" != ya29.* ]]; then
   echo "freshness: unexpected access token (not an SA token): $(head -c 80 <<<"$token")" >&2
   exit 1
