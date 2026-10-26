@@ -33,10 +33,22 @@ repository=${GITHUB_REPOSITORY_NAME:-eswrops/rust-api-deployment-starter}
 repository_id=${GITHUB_REPOSITORY_ID:-1434567946}
 branch=${ALLOWED_REF:-refs/heads/main}
 
-# Keep the existing mappings and add repository_id so IAM conditions and
-# principalSet URLs can use it later. update-oidc replaces the full mapping,
-# so every previously mapped attribute is restated here.
-attribute_mapping='google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref,attribute.repository_id=assertion.repository_id'
+# Keep the existing mappings and add repository_id so IAM conditions can
+# use it. update-oidc REPLACES the full mapping, so merge into whatever the
+# provider currently maps (other scripts may have added attributes, e.g.
+# attribute.monitor_scope from ops/gce-configure-backup-monitor.sh).
+attribute_mapping="$(python3 - "$(
+  gcloud iam workload-identity-pools providers describe "$provider" \
+    --workload-identity-pool="$pool" --location=global --project="$project_id" \
+    --format='value(attributeMapping)'
+)" <<'PY'
+import sys
+pairs = [p for p in sys.argv[1].split(";") if p]
+if not any(p.split("=", 1)[0] == "attribute.repository_id" for p in pairs):
+    pairs.append("attribute.repository_id=assertion.repository_id")
+print(",".join(pairs))
+PY
+)"
 new_condition="assertion.repository_id=='${repository_id}' && assertion.ref=='${branch}'"
 old_condition="assertion.repository=='${repository}'"
 
