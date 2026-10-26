@@ -111,7 +111,8 @@ Deployment executed 2026-10-27 (UTC timestamps from the systems involved):
 | Post-deploy: systemd | `rust-api` active/running (PID restarted 19:01:44 UTC), clean journal start with `database=sqlite:///var/lib/rust-api/app.db` |
 | Post-deploy: local health | `/health/live` and `/health/ready` → `200 {"status":"ok","version":"0f7c3956…"}` |
 | Post-deploy: public HTTPS | `https://api-bench.thetechs.top/health/live` and `/health/ready` → `200` with the new version, verified from the VM and from an external network |
-| Deployed commit SHA | `0f7c3956372e43888d9634b703def81993388fa5` |
+| Repeatability deploy | Runbook commit `4b9d4431…` (workflow/doc changes only) went through the full pipeline (run `40383772065`, all six jobs success) and activated cleanly — the deploy path is repeatable, and all three release directories are retained for rollback |
+| Final deployed commit SHA | `4b9d4431298cfe9b642bd31dff9bf82b60e706f4` (production code identical to `0f7c3956372e43888d9634b703def81993388fa5`; only the runbook and CI path filter changed) |
 
 Notes from the run:
 
