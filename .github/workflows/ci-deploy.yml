@@ -77,14 +77,20 @@ jobs:
           common=(
             --project="$GCP_PROJECT_ID"
             --zone="$GCE_ZONE"
-            --tunnel-through-iap
-            --ssh-key-file="$key"
-            --ssh-key-expire-after=10m
             --quiet
           )
-          # This adds a ten-minute instance metadata key for the restricted
-          # deploy user; no private key is stored in GitHub or Google Cloud.
-          gcloud compute ssh "deploy@${GCE_INSTANCE}" "${common[@]}" --command=true
+          # Preserve operator keys, replace stale deploy keys, and add this
+          # run's ten-minute key. This avoids gcloud compute ssh's unbounded
+          # key-propagation wait on hosted runners.
+          ssh_keys="$RUNNER_TEMP/instance-ssh-keys"
+          gcloud compute instances describe "$GCE_INSTANCE" "${common[@]}" --format=json \
+            | jq -r '.metadata.items[]? | select(.key == "ssh-keys") | .value' \
+            | grep -v '^deploy:' >"$ssh_keys" || true
+          expires="$(date --utc --date='+10 minutes' --iso-8601=seconds)"
+          printf 'deploy:%s google-ssh {"userName":"deploy","expireOn":"%s"}\n' \
+            "$(<"$key.pub")" "$expires" >>"$ssh_keys"
+          gcloud compute instances add-metadata "$GCE_INSTANCE" "${common[@]}" \
+            --metadata-from-file="ssh-keys=$ssh_keys"
           local_port=2222
           tunnel_log="$RUNNER_TEMP/iap-tunnel.log"
           gcloud compute start-iap-tunnel "$GCE_INSTANCE" 22 \
@@ -111,6 +117,13 @@ jobs:
             -o StrictHostKeyChecking=accept-new
             -o UserKnownHostsFile="$RUNNER_TEMP/google_compute_known_hosts"
           )
+          for _ in $(seq 1 30); do
+            if ssh "${ssh_options[@]}" deploy@127.0.0.1 true; then
+              break
+            fi
+            sleep 2
+          done
+          ssh "${ssh_options[@]}" deploy@127.0.0.1 true
           scp "${ssh_options[@]}" rust-api \
             "deploy@127.0.0.1:/home/deploy/incoming/rust-api-${GITHUB_SHA}"
           digest="$(sha256sum rust-api | awk '{print $1}')"
