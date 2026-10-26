@@ -6,6 +6,11 @@ set -Eeuo pipefail
 [[ ${EUID} -eq 0 ]] || { echo 'must run as root' >&2; exit 1; }
 assets=${1:?usage: gce-bootstrap.sh ASSET_DIRECTORY}
 [[ -d $assets ]] || { echo "asset directory does not exist: $assets" >&2; exit 1; }
+operator_user=${SUDO_USER:-}
+[[ -n $operator_user && $operator_user != deploy && $operator_user != rustapi ]] || {
+  echo 'bootstrap must be invoked through sudo by an operator account' >&2
+  exit 1
+}
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
@@ -24,7 +29,16 @@ install -m 0644 -o root -g root "$assets/Caddyfile" /etc/caddy/Caddyfile
 printf '%s\n' 'deploy ALL=(root) NOPASSWD: /usr/local/sbin/rust-api-activate' \
   >/etc/sudoers.d/rust-api-deploy
 chmod 0440 /etc/sudoers.d/rust-api-deploy
+printf '%s ALL=(root) NOPASSWD: ALL\n' "$operator_user" >/etc/sudoers.d/rust-api-operator
+chmod 0440 /etc/sudoers.d/rust-api-operator
+# The Google guest agent adds metadata-SSH users to this group. Disable its
+# broad sudo grant; operators and the deploy user have explicit rules above.
+if [[ -f /etc/sudoers.d/google_sudoers ]]; then
+  sed -i 's/^%google-sudoers /# %google-sudoers disabled: /' /etc/sudoers.d/google_sudoers
+fi
+gpasswd -d deploy google-sudoers >/dev/null 2>&1 || true
 visudo -cf /etc/sudoers.d/rust-api-deploy
+visudo -cf /etc/sudoers.d/rust-api-operator
 caddy validate --config /etc/caddy/Caddyfile
 
 ufw --force reset
