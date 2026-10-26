@@ -1,5 +1,4 @@
-# Replace this hostname with your actual DNS name.
-api.example.com {
+api-bench.thetechs.top {
     encode zstd gzip
     reverse_proxy 127.0.0.1:8080
 }
