@@ -97,6 +97,7 @@ jobs:
             --project="$GCP_PROJECT_ID" \
             --zone="$GCE_ZONE" \
             --local-host-port="127.0.0.1:${local_port}" \
+            --iap-tunnel-disable-connection-check \
             --quiet >"$tunnel_log" 2>&1 &
           tunnel_pid=$!
           cleanup() {
@@ -124,7 +125,11 @@ jobs:
             sleep 2
           done
           ssh "${ssh_options[@]}" deploy@127.0.0.1 true
-          scp "${ssh_options[@]}" rust-api \
+          scp -i "$key" -P "$local_port" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=accept-new \
+            -o UserKnownHostsFile="$RUNNER_TEMP/google_compute_known_hosts" \
+            rust-api \
             "deploy@127.0.0.1:/home/deploy/incoming/rust-api-${GITHUB_SHA}"
           digest="$(sha256sum rust-api | awk '{print $1}')"
           ssh "${ssh_options[@]}" deploy@127.0.0.1 \
