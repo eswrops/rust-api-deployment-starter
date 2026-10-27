@@ -90,6 +90,7 @@ jobs:
           bash ops/test/test-backfill-release-digests.sh
           bash ops/test/test-backfill-preflight.sh
           bash ops/test/test-install-rust-api-activation.sh
+          bash ops/test/test-verify-feedapi-isolation.sh
           bash .github/scripts/test-deploy-changes.sh
           bash .github/scripts/test-deploy-still-current.sh
 

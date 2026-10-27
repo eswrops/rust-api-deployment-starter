@@ -11,6 +11,16 @@
 #
 #   --binary <file>  installs a locally built binary instead of a CI artifact
 #   --skip-seed      do not upload/verify the seed database (already present)
+#   --migrate-ownership
+#                    perform the controlled stop -> chown -> start handover
+#                    when /var/lib/feed-api/feed.db is still owned by the old
+#                    shared `rustapi` identity (one-time maintenance op)
+#
+# The service runs under a DEDICATED `feedapi` system identity (created
+# idempotently): the public challenge API must not be able to read
+# production SQLite, backup credentials or deployment SSH material. The
+# installer ends with explicit negative permission tests that must FAIL to
+# pass; ops/verify-feedapi-isolation.sh checks the full matrix on the VM.
 #
 # The seed database (~250 MB) is relayed through the private backup bucket
 # (workstation -> gs://<bucket>/imports/, VM -> JSON API download with the
@@ -30,6 +40,7 @@ RUN_ID=""
 BINARY=""
 SEED_DB="${SEED_DB:-/Users/eswr/code/arjaythedev/twelve-dollar-server-challenge/seed/feed.db}"
 SKIP_SEED=0
+MIGRATE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -37,6 +48,7 @@ while [ $# -gt 0 ]; do
     --binary) BINARY="$2"; shift 2 ;;
     --seed-db) SEED_DB="$2"; shift 2 ;;
     --skip-seed) SKIP_SEED=1; shift ;;
+    --migrate-ownership) MIGRATE=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -58,8 +70,18 @@ sha_of() {
 GIT_SHA="$(git -C "$HERE" rev-parse HEAD)"
 release="/opt/feed-api/releases/${GIT_SHA}"
 
-# 1/6 Obtain the Linux AMD64 binary.
-step "1/6 obtain feed-api binary"
+# 0/7 Dedicated service identity (idempotent).
+step "0/7 ensure the dedicated feedapi service identity"
+vm "set -e
+  getent group feedapi >/dev/null 2>&1 || sudo groupadd --system feedapi
+  if ! getent passwd feedapi >/dev/null 2>&1; then
+    sudo useradd --system --gid feedapi --no-create-home \
+      --home-dir /var/lib/feed-api --shell /usr/sbin/nologin feedapi
+  fi
+  echo \"identity: \$(id feedapi)\"" || fail "feedapi identity creation failed"
+
+# 1/7 Obtain the Linux AMD64 binary.
+step "1/7 obtain feed-api binary"
 if [ -n "$BINARY" ]; then
   [ -f "$BINARY" ] || fail "binary not found: $BINARY"
   cp "$BINARY" "$work/feed-api"
@@ -74,8 +96,8 @@ echo "binary digest: $digest"
 "${SCP[@]}" "$work/feed-api" "${INSTANCE}:/home/$(whoami)/feed-api-${GIT_SHA}" \
   || fail "binary upload failed"
 
-# 2/6 Seed database through the backup bucket relay.
-step "2/6 seed database"
+# 2/7 Seed database through the backup bucket relay.
+step "2/7 seed database"
 if [ "$SKIP_SEED" -eq 1 ]; then
   echo "skipped (--skip-seed)"
 elif [ -f "$SEED_DB" ] && vm "test -s /var/lib/feed-api/feed.db"; then
@@ -92,10 +114,10 @@ else
   gcloud storage cp "$SEED_DB" "gs://${BUCKET}/imports/feed.db" || fail "seed upload to GCS failed"
   echo "downloading on the VM via the backup identity (GCS relay)"
   vm "set -e
-    sudo install -d -o rustapi -g rustapi -m 0750 /var/lib/feed-api
+    sudo install -d -o feedapi -g feedapi -m 0750 /var/lib/feed-api
     sudo sh -c 'set -a; . /etc/rust-api/backup.env; set +a; GCS_HTTP_TIMEOUT=600; export GCS_HTTP_TIMEOUT; . /usr/local/sbin/rust-api-backup-lib.sh; gcs_download \"\$GCS_KEY_FILE\" \"\$GCS_BUCKET\" imports/feed.db /var/lib/feed-api/feed.db.partial'
     sudo mv /var/lib/feed-api/feed.db.partial /var/lib/feed-api/feed.db
-    sudo chown rustapi:rustapi /var/lib/feed-api/feed.db
+    sudo chown feedapi:feedapi /var/lib/feed-api/feed.db
     sudo chmod 0640 /var/lib/feed-api/feed.db
     actual=\$(sudo sha256sum /var/lib/feed-api/feed.db | awk '{print \$1}')
     [ \"\$actual\" = '${seed_digest}' ] || { echo 'seed digest mismatch' >&2; exit 1; }
@@ -103,8 +125,8 @@ else
   gcloud storage rm "gs://${BUCKET}/imports/feed.db" >/dev/null 2>&1 || echo "warning: could not delete gs://${BUCKET}/imports/feed.db (retention will expire it)" >&2
 fi
 
-# 3/6 Binary + env file.
-step "3/6 install binary and environment"
+# 3/7 Binary + env file.
+step "3/7 install binary and environment"
 vm "set -e
   sudo install -d -m 0755 -o root -g root /opt/feed-api /opt/feed-api/releases '${release}'
   sudo install -m 0755 -o root -g root '/home/$(whoami)/feed-api-${GIT_SHA}' '${release}/feed-api'
@@ -112,16 +134,38 @@ vm "set -e
   [ \"\$actual\" = '${digest}' ] || { echo 'binary digest mismatch' >&2; exit 1; }
   sudo ln -sfn '${release}' /opt/feed-api/.current-next
   sudo mv -Tf /opt/feed-api/.current-next /opt/feed-api/current
-  sudo install -d -m 0750 -o root -g rustapi /etc/feed-api
+  sudo install -d -m 0750 -o root -g feedapi /etc/feed-api
   printf 'HOST=127.0.0.1\nPORT=${FEED_PORT}\nSQLITE_PATH=/var/lib/feed-api/feed.db\nJWT_SECRET=twelve-dollar-challenge\nRUST_LOG=info,tower_http=warn\n' \
     | sudo tee /etc/feed-api/env >/dev/null
-  sudo chown root:rustapi /etc/feed-api/env
+  sudo chown root:feedapi /etc/feed-api/env
   sudo chmod 0640 /etc/feed-api/env
   rm -f '/home/$(whoami)/feed-api-${GIT_SHA}'
   echo 'binary installed: ${release}/feed-api (sha256 verified)'" || fail "binary/env install failed"
 
-# 4/6 systemd unit.
-step "4/6 install and start feed-api.service"
+# 4/7 Feed database ownership handover (controlled; one-time).
+step "4/7 feed database ownership (feedapi)"
+vm "set -e
+  if [ -f /var/lib/feed-api/feed.db ] && [ \"\$(stat -c '%U' /var/lib/feed-api/feed.db)\" = 'rustapi' ]; then
+    if [ '${MIGRATE}' -ne 1 ]; then
+      echo 'feed.db is still owned by the shared rustapi identity; re-run with --migrate-ownership for the controlled stop -> chown -> start handover' >&2
+      exit 1
+    fi
+    echo 'controlled ownership handover: stopping feed-api'
+    sudo systemctl stop feed-api
+    sudo chown feedapi:feedapi /var/lib/feed-api
+    sudo chmod 0750 /var/lib/feed-api
+    for f in feed.db feed.db-wal feed.db-shm seed-pristine.db; do
+      if [ -e \"/var/lib/feed-api/\$f\" ]; then
+        sudo chown feedapi:feedapi \"/var/lib/feed-api/\$f\"
+      fi
+    done
+    echo 'ownership migrated to feedapi (the service starts in the next step)'
+  else
+    echo 'feed.db ownership already correct (or no database yet)'
+  fi" || fail "ownership handover failed"
+
+# 5/7 systemd unit.
+step "5/7 install and start feed-api.service"
 "${SCP[@]}" "$HERE/../config/feed-api.service" "${INSTANCE}:/home/$(whoami)/feed-api.service" || fail "unit upload failed"
 vm "set -e
   sudo install -m 0644 -o root -g root '/home/$(whoami)/feed-api.service' /etc/systemd/system/feed-api.service
@@ -132,10 +176,25 @@ vm "set -e
     curl -fsS --max-time 2 http://127.0.0.1:${FEED_PORT}/health >/dev/null 2>&1 && break
     sleep 1
   done
-  curl -fsS http://127.0.0.1:${FEED_PORT}/health" || fail "feed-api service did not become healthy"
+  curl -fsS http://127.0.0.1:${FEED_PORT}/health
+  # Isolation gate: the public feedapi identity must NOT reach production
+  # material. These negative tests must FAIL to pass.
+  for p in /etc/rust-api/app.env /etc/rust-api/backup.env /etc/rust-api/backup-gcs-key.json; do
+    if sudo runuser -u feedapi -- test -r \"\$p\" 2>/dev/null; then
+      echo \"ISOLATION FAILURE: feedapi can read \$p\" >&2
+      exit 1
+    fi
+  done
+  if sudo runuser -u feedapi -- test -w /var/lib/rust-api/app.db 2>/dev/null; then
+    echo 'ISOLATION FAILURE: feedapi can write the production database' >&2
+    exit 1
+  fi
+  sudo runuser -u feedapi -- test -r /var/lib/feed-api/feed.db
+  sudo runuser -u feedapi -- test -x /opt/feed-api/current/feed-api
+  echo 'isolation checks passed'" || fail "feed-api service did not become healthy / isolation gate failed"
 
-# 5/6 Caddy routing.
-step "5/6 update Caddy routing"
+# 6/7 Caddy routing.
+step "6/7 update Caddy routing"
 "${SCP[@]}" "$HERE/../config/Caddyfile" "${INSTANCE}:/home/$(whoami)/Caddyfile.new" || fail "Caddyfile upload failed"
 vm "set -e
   caddy validate --config '/home/$(whoami)/Caddyfile.new' >/dev/null
@@ -145,8 +204,8 @@ vm "set -e
   sudo systemctl reload caddy
   echo 'caddy reloaded'" || fail "caddy update failed"
 
-# 6/6 End-to-end verification through the public site.
-step "6/6 verify through ${SITE}"
+# 7/7 End-to-end verification through the public site.
+step "7/7 verify through ${SITE}"
 sleep 3
 echo "-- ${SITE}/health (feed API):"
 curl -fsS --max-time 10 "https://${SITE}/health" || fail "public /health failed"
