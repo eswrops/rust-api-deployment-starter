@@ -86,7 +86,7 @@ old_binary_digest="$(digest_of "$temp/root/releases/$OLD/rust-api")"
 run_backfill --apply
 [ "$rc" -eq 0 ] || die "apply failed (rc=$rc): $out"
 [ "$(cat "$temp/root/releases/$OLD/.digest")" = "$old_binary_digest" ] || die "recorded digest does not match the binary"
-[ "$(stat -f '%Lp' "$temp/root/releases/$OLD/.digest" 2>/dev/null || stat -c '%a' "$temp/root/releases/$OLD/.digest")" = "644" ] || die "digest file mode not 0644"
+[ -n "$(find "$temp/root/releases/$OLD/.digest" -perm 0644)" ] || die "digest file mode not 0644"
 [ "$(digest_of "$temp/root/releases/$OLD/rust-api")" = "$old_binary_digest" ] || die "binary contents changed by backfill"
 [ "$(basename "$(readlink "$temp/root/current")")" = "$OLD" ] || die "apply touched current"
 pass "--apply: digest recorded from the installed binary, binary and current untouched"
