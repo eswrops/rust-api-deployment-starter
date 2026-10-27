@@ -5,15 +5,34 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
-      # Full manual memory benchmark: run this workflow with 15000. CI runs a
-      # smaller deterministic count; the 15k run is never a deploy gate.
+      # Full manual memory benchmark: run this workflow with 15000. Capacity
+      # testing is separated from release/deployment at the job level: the
+      # build and deploy jobs below are unreachable from a dispatch that does
+      # not explicitly set deploy_production, and hold no OIDC capability.
       idle_connections:
         description: "Idle keep-alive connections for the memory benchmark"
         default: "3000"
         type: string
+      # Manual release/deploy path. Leave false for benchmark/capacity
+      # dispatches; set true only to release and deploy the current tip of
+      # main (the repository variable PRODUCTION_DEPLOY_ENABLED must also
+      # be "true").
+      deploy_production:
+        description: "Release build and production deployment of the current main tip"
+        default: false
+        type: boolean
+
+# Cancel superseded pull-request runs; push runs (the deploy path) are never
+# cancelled. Push groups are per-SHA so concurrent pushes queue independently;
+# the deploy job's concurrency group serializes production activations.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Default: no job can mint Google credentials. The deploy job is the only
 # job granted `id-token: write` (job-scoped below), so pull-request runs of
-# verify/benchmark/security hold nothing beyond repository read access.
+# verify/benchmark/security — and manual benchmark dispatches — hold nothing
+# beyond repository read access.
 permissions:
   contents: read
 
@@ -26,43 +45,32 @@ env:
 jobs:
   # Production releases/deployments are only rebuilt when something that
   # affects the deployed binary changed; benchmark-only or docs-only pushes
-  # skip the release build and deployment entirely.
+  # skip the release build and deployment entirely. The classification logic
+  # lives in .github/scripts/deploy-changes.sh (tested below) so the full
+  # push range, not just HEAD^, is considered.
   changes:
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       deploy: ${{ steps.filter.outputs.deploy }}
+      benchmark: ${{ steps.filter.outputs.benchmark }}
+      security: ${{ steps.filter.outputs.security }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+      - name: Test change-detection logic
+        run: bash .github/scripts/test-deploy-changes.sh
       - id: filter
         env:
           EVENT: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
           BASE_REF: ${{ github.base_ref }}
-        run: |
-          set -euo pipefail
-          if [ "$EVENT" = "pull_request" ]; then
-            files="$(git diff --name-only "origin/${BASE_REF}...HEAD")"
-          elif git rev-parse -q --verify 'HEAD^' >/dev/null 2>&1; then
-            files="$(git diff --name-only 'HEAD^' HEAD)"
-          else
-            # First commit on the branch: deploy.
-            echo "deploy=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "changed files:"; echo "$files"
-          # Operator tooling (ops/first-sqlite-deploy.sh, ops/install-backups.sh,
-          # ops/backup/) never triggers a release build or deploy: none of it is
-          # part of the deployed artifact.
-          files="$(echo "$files" | grep -vE '^ops/(first-sqlite-deploy|install-backups)\.sh$|^ops/backup/' || true)"
-          if echo "$files" | grep -qE '^(src/|migrations/|config/|ops/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|Dockerfile$|\.github/workflows/ci-deploy\.yml$)'; then
-            echo "deploy=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "deploy=false" >> "$GITHUB_OUTPUT"
-          fi
+        run: bash .github/scripts/deploy-changes.sh >>"$GITHUB_OUTPUT"
 
   verify:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned Rust
@@ -70,11 +78,30 @@ jobs:
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
+      # `cargo test` runs every integration test, including
+      # tests/migrations.rs (apply + idempotency + documented schema), so the
+      # migration gate does not need a second, redundant invocation.
       - run: cargo test --locked
-      - name: Validate migrations
-        run: cargo test --locked --test migrations
+      - name: Ops tooling tests (mocked GCS, mocked service manager)
+        run: |
+          bash ops/backup/test/test-rust-api-backup.sh
+          bash ops/backup/test/test-backup-freshness-check.sh
+          bash ops/test/test-rust-api-activate.sh
+          bash ops/test/test-backfill-release-digests.sh
+          bash ops/test/test-backfill-preflight.sh
+          bash ops/test/test-install-rust-api-activation.sh
+          bash ops/test/test-verify-feedapi-isolation.sh
+          bash .github/scripts/test-deploy-changes.sh
+          bash .github/scripts/test-deploy-still-current.sh
 
   benchmark:
+    # Pull requests always run the full suite (regression gate). Pushes to
+    # main run it only when the benchmark crate changed or a release build
+    # is happening (the deploy path requires this job as its gate); a
+    # docs-only push skips it.
+    if: >-
+      github.event_name != 'push' || needs.changes.outputs.benchmark == 'true'
+    needs: [changes]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -126,7 +153,11 @@ jobs:
           IDLE_COUNT: ${{ inputs.idle_connections || '3000' }}
 
   security:
+    if: >-
+      github.event_name != 'push' || needs.changes.outputs.security == 'true'
+    needs: [changes]
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: cargo-deny (production crate)
@@ -141,12 +172,19 @@ jobs:
           manifest-path: benchmark/feed-api/Cargo.toml
 
   build:
+    # Release builds happen (a) on pushes to main that touch production
+    # inputs, or (b) on an explicit dispatch with deploy_production=true.
+    # A plain benchmark dispatch (deploy_production unset/false) can never
+    # reach this job.
     if: >-
-      github.event_name != 'pull_request' &&
-      github.ref == 'refs/heads/main' &&
-      (github.event_name == 'workflow_dispatch' || needs.changes.outputs.deploy == 'true')
+      (
+        (github.event_name == 'push' && needs.changes.outputs.deploy == 'true')
+        || (github.event_name == 'workflow_dispatch' && inputs.deploy_production == true)
+      ) &&
+      github.ref == 'refs/heads/main'
     needs: [changes, verify, benchmark, security]
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: rustup toolchain install "$RUST_VERSION" --profile minimal
@@ -157,6 +195,8 @@ jobs:
         run: |
           cp target/release/rust-api rust-api
           sha256sum rust-api > rust-api.sha256
+      - name: Smoke test the built binary (migrations, live+ready, graceful SIGTERM)
+        run: bash .github/scripts/release-smoke.sh ./rust-api "$GITHUB_SHA"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rust-api-linux-amd64
@@ -167,18 +207,25 @@ jobs:
           retention-days: 7
 
   deploy:
-    # Production gate: deploys only when the repository variable
-    # PRODUCTION_DEPLOY_ENABLED is exactly "true" (set with
-    # `gh variable set PRODUCTION_DEPLOY_ENABLED --body true`, delete or set
-    # to any other value to disable). Absent variable = deploys disabled.
-    # Everything upstream of this job (verify, benchmark, security, release
-    # build) runs and produces the artifact regardless of the gate.
+    # Production gate, layered:
+    #   1. only pushes to main that touch production inputs, or an explicit
+    #      dispatch with deploy_production=true (a benchmark dispatch can
+    #      never deploy);
+    #   2. the repository variable PRODUCTION_DEPLOY_ENABLED must be exactly
+    #      "true" (delete it or set any other value to disable; absent
+    #      variable = deploys disabled);
+    #   3. the activation step itself re-verifies this run's SHA is still the
+    #      tip of main before activating.
     if: >-
-      github.event_name != 'pull_request' &&
+      (
+        (github.event_name == 'push' && needs.changes.outputs.deploy == 'true')
+        || (github.event_name == 'workflow_dispatch' && inputs.deploy_production == true)
+      ) &&
       github.ref == 'refs/heads/main' &&
       vars.PRODUCTION_DEPLOY_ENABLED == 'true'
-    needs: build
+    needs: [changes, build]
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     environment: production
     permissions:
       contents: read
@@ -190,17 +237,52 @@ jobs:
       group: rust-api-production
       cancel-in-progress: false
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+      - name: Verify this run is still the tip of main
+        id: tip
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+          echo "this run: $GITHUB_SHA"
+          rc=0
+          tip="$(bash .github/scripts/deploy-still-current.sh)" || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "tip of main: $tip (current)"
+            echo "is_tip=true" >>"$GITHUB_OUTPUT"
+          elif [ "$rc" -eq 1 ]; then
+            # Superseded: main has moved on and its own run owns production.
+            echo "::notice::Superseded: main has advanced to ${tip}; skipping deployment of ${GITHUB_SHA}"
+            {
+              echo "### Deployment skipped: superseded"
+              echo ""
+              echo "main is at \`${tip}\`; this run built \`${GITHUB_SHA}\`, which is no"
+              echo "longer the tip. The newer commit's run owns the production deployment."
+            } >>"$GITHUB_STEP_SUMMARY"
+            echo "is_tip=false" >>"$GITHUB_OUTPUT"
+          else
+            # Exit 2: the tip could not be verified. Fail closed — a
+            # deployment that cannot prove it is current must not proceed.
+            echo "could not verify the tip of main (deploy-still-current exit $rc); failing closed" >&2
+            exit 1
+          fi
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: steps.tip.outputs.is_tip == 'true'
         with:
           name: rust-api-linux-amd64
       - name: Authenticate to Google Cloud with GitHub OIDC
+        if: steps.tip.outputs.is_tip == 'true'
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
         with:
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
       - name: Install Google Cloud CLI
+        if: steps.tip.outputs.is_tip == 'true'
         uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
       - name: Upload through IAP and atomically activate
+        if: steps.tip.outputs.is_tip == 'true'
         env:
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GCE_INSTANCE: ${{ vars.GCE_INSTANCE }}
@@ -257,6 +339,7 @@ jobs:
             --iap-tunnel-disable-connection-check \
             --quiet >"$tunnel_log" 2>&1 &
           tunnel_pid=$!
+          # shellcheck disable=SC2329  # invoked via trap EXIT below
           cleanup() {
             kill "$tunnel_pid" 2>/dev/null || true
             wait "$tunnel_pid" 2>/dev/null || true
@@ -287,6 +370,18 @@ jobs:
             sleep 2
           done
           ssh "${ssh_options[@]}" deploy@127.0.0.1 true
+          # Last stale-commit guard: if another push landed on main while
+          # this run was building and connecting, its deploy owns production;
+          # activating this artifact would regress it. Failing loudly here is
+          # deliberate — we are seconds from activation. (Exit 2 from the
+          # check — unverifiable — fails the job the same way: never activate
+          # an artifact whose currency could not be proven.)
+          rc=0
+          latest_tip="$(bash .github/scripts/deploy-still-current.sh)" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "superseded or unverifiable (exit $rc): main is at ${latest_tip:-<unknown>}; refusing to activate ${GITHUB_SHA}" >&2
+            exit 1
+          fi
           destination="deploy@127.0.0.1:/home/deploy/incoming/rust-api-${GITHUB_SHA}"
           scp -i "$key" -P "$local_port" \
             -o BatchMode=yes \

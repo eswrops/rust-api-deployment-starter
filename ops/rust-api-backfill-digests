@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# Root-owned operator tool: backfill the `.digest` metadata for releases that
+# were installed before `rust-api-activate` began recording it. Re-activation
+# (manual rollback) of an installed release requires `.digest`, so older
+# retained releases are unusable as rollback targets until this has run.
+#
+#   rust-api-backfill-digests [--apply] [--root DIR]
+#
+# DRY-RUN IS THE DEFAULT: without --apply nothing on disk is changed and the
+# tool only reports what it would do. Run it first, review the report, then
+# re-run with --apply.
+#
+# Per release directory under <root>/releases:
+#   * the directory name must be a 40-hex git SHA (anything else is reported
+#     and refused — fail-visible, never silently skipped);
+#   * a symlinked release entry is refused as ambiguous;
+#   * the binary must exist, be a regular (non-symlink) file and be
+#     executable;
+#   * a missing .digest is recorded atomically (temp file + rename inside the
+#     release directory), root:root 0644;
+#   * an existing .digest that matches the computed SHA-256 is left alone
+#     (the tool is idempotent);
+#   * an existing .digest that MISMATCHES is never overwritten — that is a
+#     loud error and a non-zero exit.
+# The tool never modifies a binary, never touches the `current` symlink and
+# never removes anything. It takes the same activation lock as
+# rust-api-activate so it cannot race an in-flight deployment.
+#
+# Provenance note: hashing an installed binary proves what its contents are
+# NOW. For pre-backfill releases there is no independent record of the build
+# that produced them — the recorded digest anchors future verification and
+# rollback identity, it does not re-establish original build provenance.
+#
+# RUST_API_TEST_MODE relaxes ONLY the root check and the root:root digest
+# ownership so the logic can run in the local test harness (sudoers
+# env_reset strips it in production). Other RUST_API_* variables are test
+# hooks with production defaults:
+#   RUST_API_ROOT      [/opt/rust-api]
+#   RUST_API_LOCK_FILE [/run/lock/rust-api-activate.lock] (shared with activate)
+set -Eeuo pipefail
+test_mode="${RUST_API_TEST_MODE:-}"
+
+[[ "${EUID}" -eq 0 || -n "$test_mode" ]] || { echo "must be root" >&2; exit 1; }
+
+apply=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) apply=1 ;;
+    --root) root="$2"; shift ;;
+    *) echo "usage: rust-api-backfill-digests [--apply] [--root DIR]" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+root="${root:-${RUST_API_ROOT:-/opt/rust-api}}"
+lock_file="${RUST_API_LOCK_FILE:-/run/lock/rust-api-activate.lock}"
+releases="$root/releases"
+current="$root/current"
+
+log() { echo "backfill: $*"; }
+err() { echo "backfill: FAIL: $*" >&2; }
+sha256() { sha256sum "$@" 2>/dev/null | awk '{print $1}' || shasum -a 256 "$@" | awk '{print $1}'; }
+
+# --- activation lock (same file as rust-api-activate) ------------------------
+# Serializes against deployments: a release being installed right now has no
+# complete digest story yet, and hashing mid-install could record a digest
+# for a half-visible state. Refuse rather than wait.
+lock_dir="${lock_file}.d"
+LOCK_KIND=""
+release_lock() {
+  [ "$LOCK_KIND" = "mkdir" ] && rm -rf "$lock_dir"
+  return 0
+}
+trap release_lock EXIT
+acquire_lock() {
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$lock_file"
+    flock -n 9 || { echo "backfill: an activation is in progress; refusing to run concurrently" >&2; exit 4; }
+    LOCK_KIND="flock"
+    return 0
+  fi
+  local owner
+  for _ in 1 2 3; do
+    if mkdir "$lock_dir" 2>/dev/null; then
+      printf '%s\n' "$$" >"$lock_dir/pid"
+      LOCK_KIND="mkdir"
+      return 0
+    fi
+    owner="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -rf "$lock_dir" # stale lock from a dead process
+      continue
+    fi
+    echo "backfill: an activation is in progress; refusing to run concurrently" >&2
+    exit 4
+  done
+  echo "backfill: could not acquire the activation lock" >&2
+  exit 4
+}
+acquire_lock
+
+[ -d "$releases" ] || { err "no releases directory at $releases"; exit 1; }
+
+# record_digest RELEASE_DIR DIGEST — atomic write of the digest file. The
+# temp file lives in the release directory, so the final rename is a single
+# atomic operation on the same filesystem.
+record_digest() {
+  local dir="$1" digest="$2" tmp
+  tmp="$(mktemp "$dir/.digest.XXXXXX")"
+  printf '%s\n' "$digest" >"$tmp"
+  chmod 0644 "$tmp"
+  if [ -z "$test_mode" ]; then
+    chown root:root "$tmp"
+  fi
+  if [ -e "$dir/.digest" ]; then
+    # A digest appeared between the check and the rename (concurrent
+    # install). Refuse: this tool never overwrites.
+    rm -f "$tmp"
+    err "$dir/.digest appeared concurrently; refusing to overwrite"
+    return 1
+  fi
+  mv "$tmp" "$dir/.digest"
+}
+
+errors=0
+backfilled=0
+already=0
+active_name="$(basename "$(readlink -f "$current" 2>/dev/null || true)")"
+
+for dir in "$releases"/*/; do
+  [ -d "$dir" ] || continue
+  dir="${dir%/}"
+  name="${dir##*/}"
+
+  if ! [[ "$name" =~ ^[[:xdigit:]]{40}$ ]]; then
+    err "$name: not a 40-hex release name — refusing to touch"
+    errors=$((errors + 1))
+    continue
+  fi
+  if [ -L "$dir" ]; then
+    err "$name: release entry is a symlink (ambiguous) — refusing"
+    errors=$((errors + 1))
+    continue
+  fi
+
+  binary="$dir/rust-api"
+  if [ -L "$binary" ] || [ ! -f "$binary" ]; then
+    err "$name: binary missing or not a regular file — refusing"
+    errors=$((errors + 1))
+    continue
+  fi
+  if [ ! -x "$binary" ]; then
+    err "$name: binary is not executable — refusing"
+    errors=$((errors + 1))
+    continue
+  fi
+
+  digest="$(sha256 "$binary")"
+  if [ -z "$digest" ]; then
+    err "$name: could not compute SHA-256 — refusing"
+    errors=$((errors + 1))
+    continue
+  fi
+
+  if [ -f "$dir/.digest" ]; then
+    recorded="$(cat "$dir/.digest")"
+    if [ "$recorded" = "$digest" ]; then
+      log "$name: digest already recorded and correct"
+      already=$((already + 1))
+    else
+      err "$name: existing .digest ($recorded) does not match the binary ($digest) — NOT overwriting; investigate this release"
+      errors=$((errors + 1))
+    fi
+    continue
+  fi
+
+  if [ "$apply" -eq 1 ]; then
+    if record_digest "$dir" "$digest"; then
+      suffix=""
+      [ "$name" = "$active_name" ] && suffix=" (active release)"
+      log "$name: recorded digest $digest$suffix"
+      backfilled=$((backfilled + 1))
+    else
+      errors=$((errors + 1))
+    fi
+  else
+    log "$name: would record digest $digest (dry run)"
+  fi
+done
+
+mode="DRY RUN"
+[ "$apply" -eq 1 ] && mode="APPLY"
+log "$mode summary: $((backfilled + already + errors)) release(s) scanned, $backfilled digest(s) recorded, $already already correct, $errors refused"
+[ "$errors" -eq 0 ] || exit 1

@@ -26,6 +26,7 @@
 #   BACKUP_MAX_AGE_HOURS default 30
 #   DRILL_MAX_AGE_DAYS   default 9
 #   GCS_API_BASE         default https://storage.googleapis.com (tests)
+#   TOKENINFO_URL        default https://oauth2.googleapis.com/tokeninfo (tests)
 set -Eeuo pipefail
 
 bucket="${GCS_BUCKET:?GCS_BUCKET must be set}"
@@ -42,16 +43,25 @@ fail() { echo "freshness: FAIL: $*" >&2; failures=$((failures + 1)); }
 # path mints an SA token through iamcredentials, which for federated
 # (WIF) callers requires roles/iam.serviceAccountTokenCreator on the SA —
 # granted to the repository-restricted WIF principal for this monitor.
+#
+# Token hygiene: the token value must never appear in this script's output.
+# gcloud errors go to stderr verbatim (they carry no token); a malformed
+# token is described by its SOURCE and expected shape only — no substring
+# of the value is ever printed.
 if [ -n "${GCS_ACCESS_TOKEN:-}" ]; then
   token="$GCS_ACCESS_TOKEN"
 else
-  token="$(gcloud auth print-access-token 2>&1)" || {
-    echo "freshness: cannot obtain an access token: $token" >&2
+  token="$(gcloud auth print-access-token)" || {
+    echo "freshness: cannot obtain an access token via gcloud (see gcloud error above)" >&2
     exit 1
   }
 fi
 if [[ "$token" != ya29.* ]]; then
-  echo "freshness: unexpected access token (not an SA token): $(head -c 80 <<<"$token")" >&2
+  if [ -n "${GCS_ACCESS_TOKEN:-}" ]; then
+    echo "freshness: GCS_ACCESS_TOKEN does not look like an SA access token (expected 'ya29.' prefix); refusing to use it" >&2
+  else
+    echo "freshness: gcloud returned a credential that is not an SA access token (expected 'ya29.' prefix)" >&2
+  fi
   exit 1
 fi
 
@@ -67,8 +77,14 @@ show_body() { echo "freshness: response: $(head -c 200 "$body")" >&2; }
 
 # On a 403, identify the failing token (email/scope) so permission issues
 # can be attributed to the right identity instead of guessed at.
+# TOKENINFO_URL is overridable for tests. The token is sent as a POST form
+# body, never as a URL query parameter: query strings can leak into proxy,
+# server, and shell logs. If the endpoint is unreachable, identity
+# attribution is skipped rather than retried elsewhere — the HTTP status
+# and response excerpt above remain the primary diagnostics.
 show_tokeninfo() {
-  curl -sS --max-time 10 "https://oauth2.googleapis.com/tokeninfo?access_token=$token" 2>/dev/null \
+  curl -sS --max-time 10 -X POST "${TOKENINFO_URL:-https://oauth2.googleapis.com/tokeninfo}" \
+    --data-urlencode "access_token=$token" 2>/dev/null \
     | jq -r 'if .email then "token identity: \(.email // "?") scope: \(.scope // "?")" else "tokeninfo unavailable" end' >&2 || true
 }
 
@@ -107,7 +123,9 @@ if [ "$code" != "200" ]; then
   [ "$code" != "network" ] && { show_body; [ "$code" = "403" ] && show_tokeninfo; }
   fail "drill listing returned HTTP $code"
 else
-  newest="$(jq -r '.items[]?.name // empty' "$body" | grep -E '^drills/drill-[0-9T]+Z\.txt$' | sort | tail -1)"
+  # grep exits 1 on an empty match: tolerate it so an empty listing reaches
+  # the diagnostic branch below instead of tripping pipefail silently.
+  newest="$(jq -r '.items[]?.name // empty' "$body" | { grep -E '^drills/drill-[0-9T]+Z\.txt$' || true; } | sort | tail -1)"
   if [ -z "$newest" ]; then
     fail "no drill reports under gs://${bucket}/drills/ — weekly restore drill has never succeeded"
   else

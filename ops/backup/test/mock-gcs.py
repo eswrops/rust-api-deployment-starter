@@ -6,11 +6,17 @@ in-memory, with enough fidelity to exercise pagination, versioning and
 failure injection:
 
   POST   /token                                     -> {"access_token": "..."}
+  POST   /tokeninfo                                 -> identity of the access_token form field
+  GET    /tokeninfo                                 -> 405 (token must not travel in a URL)
   GET    /storage/v1/b/<bucket>/o?prefix&versions&maxResults&pageToken
   POST   /upload/storage/v1/b/<bucket>/o?...&name=<object>
   GET    /storage/v1/b/<bucket>/o/<object>?alt=media
   DELETE /storage/v1/b/<bucket>/o/<object>?generation=<g>
   GET    /_/dump                                    -> state for assertions
+
+tokeninfo requests are logged as {"method", "path", "body"} in
+STATE["tokeninfo_requests"] so tests can assert the token arrived in the
+POST body and never in the query string.
 
 State file (JSON): {"objects": {"<name>": {"versions": [
   {"generation": 1, "updated": "...Z", "timeDeleted": null, "content_b64": "..."}]}}}
@@ -21,7 +27,7 @@ listings.
 Behavior file (JSON) injects failures:
   {"list_status": 403, "list_body": "<raw body override>",
    "list_delay": 8, "delete_fail": {"<name>": 500}, "delete_delay": 5,
-   "upload_fail": {"heartbeat.txt": 500}}
+   "upload_fail": {"heartbeat.txt": 500}, "get_fail": {"heartbeat.txt": 403}}
 """
 import argparse
 import base64
@@ -34,7 +40,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
 LOCK = threading.Lock()
-STATE = {"objects": {}, "delete_log": []}
+STATE = {"objects": {}, "delete_log": [], "tokeninfo_requests": []}
 BEHAVIOR = {}
 
 
@@ -60,6 +66,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/tokeninfo":
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length).decode()
+            with LOCK:
+                STATE["tokeninfo_requests"].append(
+                    {"method": "POST", "path": parsed.path, "body": body})
+            fields = dict(pair.split("=", 1) for pair in body.split("&") if "=" in pair)
+            token = fields.get("access_token", "")
+            if not token:
+                self._send_json(400, {"error": "invalid_request"})
+            elif token.startswith("ya29.attributed-"):
+                self._send_json(200, {"email": "monitor@example.iam.gserviceaccount.com",
+                                      "scope": "https://www.googleapis.com/auth/devstorage.read_only"})
+            else:
+                self._send_json(400, {"error": "invalid_token"})
+            return
         if parsed.path == "/token":
             length = int(self.headers.get("Content-Length") or 0)
             self.rfile.read(length)
@@ -95,6 +117,14 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/_/dump":
             with LOCK:
                 self._send_json(200, STATE)
+            return
+        if parsed.path == "/tokeninfo":
+            # GET with the token in the query string is the pattern the
+            # freshness check must not regress to; record and reject it.
+            with LOCK:
+                STATE["tokeninfo_requests"].append(
+                    {"method": "GET", "path": parsed.path, "body": ""})
+            self._send_json(405, {"error": "method_not_allowed"})
             return
         # /storage/v1/b/<bucket>/o  (listing)
         parts = parsed.path.split("/")
@@ -136,6 +166,11 @@ class Handler(BaseHTTPRequestHandler):
         # /storage/v1/b/<bucket>/o/<object>
         if len(parts) == 7 and parts[1] == "storage" and parts[5] == "o":
             name = unquote(parts[6])
+            get_fail = BEHAVIOR.get("get_fail") or {}
+            if name in get_fail:
+                code = get_fail[name]
+                self._send_json(code, {"error": {"code": code, "message": "injected get failure"}})
+                return
             with LOCK:
                 versions = STATE["objects"].get(name, {}).get("versions", [])
                 live = [v for v in versions if v["timeDeleted"] is None]

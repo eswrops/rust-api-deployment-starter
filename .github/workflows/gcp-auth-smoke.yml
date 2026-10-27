@@ -12,6 +12,40 @@ on:
 permissions:
   contents: read
 jobs:
+  # Prints the claims of THIS job's own OIDC token payload (never the token
+  # itself, never the signature). Purpose: verify empirically which
+  # workflow-identity claims GitHub populates for an ordinary (non-reusable)
+  # workflow job in this repository before an IAM provider condition is
+  # built on them — docs/oidc-workflow-narrowing-proposal.md. The job only
+  # mints and decodes the token; it does not touch Google Cloud.
+  claims:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+      # The OIDC token is fetched from the Actions API and decoded locally.
+      # The payload contains only public metadata (repo, ref, run id...).
+    steps:
+      - name: Mint an OIDC token and print its payload claims
+        run: |
+          set -Eeuo pipefail
+          # Populated by the runner because this job holds id-token: write.
+          url="${ACTIONS_ID_TOKEN_REQUEST_URL:?Actions OIDC endpoint missing}"
+          req_token="${ACTIONS_ID_TOKEN_REQUEST_TOKEN:?Actions OIDC request token missing}"
+          token="$(curl --fail --silent \
+            -H "Authorization: Bearer $req_token" \
+            "${url}&audience=wif-claims-verification" | jq -r '.value')"
+          test -n "$token" && test "$token" != "null"
+          # Decode ONLY the payload (field 2); the signature is never printed.
+          payload="$(printf '%s' "$token" | cut -d. -f2)"
+          python3 - "$payload" <<'PY'
+          import base64, json, sys
+          padded = sys.argv[1] + "=" * (-len(sys.argv[1]) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(padded))
+          print(json.dumps(claims, indent=2, sort_keys=True))
+          PY
+
   smoke:
     # Same environment as the deploy job so any environment-scoped claims
     # and protection rules apply identically.

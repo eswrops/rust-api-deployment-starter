@@ -1,43 +1,270 @@
 #!/usr/bin/env bash
-# Root-owned, invoked through tightly scoped sudoers entry.
+# Root-owned, invoked through tightly scoped sudoers entry:
+#   sudo /usr/local/sbin/rust-api-activate <40-hex git sha> <64-hex sha256>
+#
+# Activation pipeline:
+#   1. validate arguments and the uploaded artifact (existence, owner,
+#      regular file, digest);
+#   2. take the activation lock (a concurrent activation is REFUSED, not
+#      queued — the losing deploy must fail loudly, not stack silently);
+#   3. install into /opt/rust-api/releases/<sha>/ and atomically replace the
+#      `current` symlink (single GNU mv -T rename on the VM); if that atomic
+#      replacement fails, the previous release stays active and untouched
+#      and the activation fails — the active symlink is never deleted;
+#   4. restart the service and poll readiness, then verify the RUNNING
+#      process actually serves the new release (/health/live reports the
+#      build SHA as `version`) — a restart that left the old binary up is
+#      a failed activation, not a success;
+#   5. only after that: remove the uploaded copy, prune old releases,
+#      append history.
+#
+# On any failure after the symlink swap: restore the previous known-good
+# release, restart, and VERIFY the rollback reached readiness. The exit
+# code is non-zero in every failure case — a completed rollback is
+# reported as recovery, never as deployment success.
+#
+# Manual rollback (documented in ops/first-sqlite-deploy.sh) re-runs this
+# script with the previous release's sha + digest. The uploaded copy is
+# deleted after a successful activation, so re-activation falls back to
+# the already-installed release directory and re-verifies the digest
+# recorded at install time.
+#
+# RUST_API_TEST_MODE relaxes ONLY the host-specific bits (root check,
+# upload-owner check, root:root install flags) so the logic can run in the
+# local test harness; production sudoers uses env_reset, which strips it.
+# Other RUST_API_* variables are test hooks with production defaults:
+#   RUST_API_ROOT          [/opt/rust-api]
+#   RUST_API_INCOMING      [/home/deploy/incoming]
+#   RUST_API_LOCK_FILE     [/run/lock/rust-api-activate.lock]
+#   RUST_API_RESTART_CMD   [systemctl restart rust-api]
+#   RUST_API_HEALTH_BASE   [http://127.0.0.1:8080]
+#   RUST_API_READY_ATTEMPTS[20] — 1 s apart
+#   RUST_API_RETAIN_EXTRA  [3] — releases kept besides current + previous
+#   RUST_API_FAIL_ATOMIC_SWAP [unset] — make the symlink rename fail on
+#     purpose (regression tests for the failed-atomic-rename path)
 set -Eeuo pipefail
-[[ "${EUID}" -eq 0 ]] || { echo "must be root" >&2; exit 1; }
+test_mode="${RUST_API_TEST_MODE:-}"
+
+[[ "${EUID}" -eq 0 || -n "$test_mode" ]] || { echo "must be root" >&2; exit 1; }
+
+root="${RUST_API_ROOT:-/opt/rust-api}"
+incoming="${RUST_API_INCOMING:-/home/deploy/incoming}"
+lock_file="${RUST_API_LOCK_FILE:-/run/lock/rust-api-activate.lock}"
+restart_cmd="${RUST_API_RESTART_CMD:-systemctl restart rust-api}"
+health_base="${RUST_API_HEALTH_BASE:-http://127.0.0.1:8080}"
+ready_attempts="${RUST_API_READY_ATTEMPTS:-20}"
+retain_extra="${RUST_API_RETAIN_EXTRA:-3}"
+releases="$root/releases"
+current="$root/current"
+history="$root/history.log"
+
 sha="${1:-}"
 expected="${2:-}"
 [[ "$sha" =~ ^[[:xdigit:]]{40}$ ]] || { echo "invalid git SHA" >&2; exit 2; }
 [[ "$expected" =~ ^[[:xdigit:]]{64}$ ]] || { echo "invalid digest" >&2; exit 2; }
-source="/home/deploy/incoming/rust-api-${sha}"
-release="/opt/rust-api/releases/${sha}"
-current="/opt/rust-api/current"
-[[ -f "$source" && ! -L "$source" ]] || { echo "missing regular uploaded binary" >&2; exit 3; }
-[[ "$(stat -c '%U' "$source")" == "deploy" ]] || { echo "unexpected upload owner" >&2; exit 3; }
-actual="$(sha256sum "$source" | awk '{print $1}')"
-[[ "$actual" == "$expected" ]] || { echo "checksum mismatch" >&2; exit 3; }
-mkdir -p "$release"
-install -m 0755 -o root -g root "$source" "$release/rust-api"
-previous="$(readlink -f "$current" 2>/dev/null || true)"
-ln -sfn "$release" "/opt/rust-api/.current-next"
-mv -Tf "/opt/rust-api/.current-next" "$current"
-if ! systemctl restart rust-api; then
-  echo "restart failed" >&2
-else
-  for _ in $(seq 1 20); do
-    if curl --fail --silent --show-error --max-time 2 \
-      http://127.0.0.1:8080/health/ready >/dev/null 2>&1; then
-      rm -f "$source"
-      echo "deployed $sha"
-      exit 0
+
+log() { echo "activate: $*"; }
+fail() { echo "activate: FAIL: $*" >&2; }
+
+sha256() { sha256sum "$@" 2>/dev/null | awk '{print $1}' || shasum -a 256 "$@" | awk '{print $1}'; }
+
+# --- activation lock ---------------------------------------------------------
+# flock is the production mechanism (auto-released on process death). Where
+# it is unavailable (macOS dev/test hosts), fall back to a mkdir lock with
+# pid-liveness stale detection.
+lock_dir="${lock_file}.d"
+LOCK_KIND=""
+release_lock() {
+  [ "$LOCK_KIND" = "mkdir" ] && rm -rf "$lock_dir"
+  return 0
+}
+trap release_lock EXIT
+acquire_lock() {
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$lock_file"
+    flock -n 9 || { echo "activate: another activation is in progress; refusing to run concurrently" >&2; exit 4; }
+    LOCK_KIND="flock"
+    return 0
+  fi
+  local owner
+  for _ in 1 2 3; do
+    if mkdir "$lock_dir" 2>/dev/null; then
+      printf '%s\n' "$$" >"$lock_dir/pid"
+      LOCK_KIND="mkdir"
+      return 0
+    fi
+    owner="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -rf "$lock_dir" # stale lock from a dead process
+      continue
+    fi
+    echo "activate: another activation is in progress; refusing to run concurrently" >&2
+    exit 4
+  done
+  echo "activate: could not acquire the activation lock" >&2
+  exit 4
+}
+acquire_lock
+
+# --- helpers -----------------------------------------------------------------
+
+# Test-only portability shim for BSD mv (macOS dev/test hosts): BSD mv has
+# no -T, so the swap cannot be a single rename there. This DELETES the
+# active symlink before recreating it and is therefore never acceptable on
+# production Linux. Reachable only under RUST_API_TEST_MODE, which sudoers
+# env_reset strips on the VM.
+swap_to_bsd_nonatomic() {
+  rm -f "$current"
+  mv "$root/.current-next" "$current"
+}
+
+# Atomic current-symlink replacement. On the VM this MUST be the single GNU
+# rename(2) that `mv -T` performs: the active symlink is replaced in place
+# and never passes through a state where it does not exist. If the atomic
+# rename fails (EBUSY, cross-device, permissions...), the previous release
+# is left active and untouched, and the failure propagates — there is no
+# rm-then-mv fallback on production. RUST_API_FAIL_ATOMIC_SWAP is a test
+# hook that makes the rename fail on purpose (also stripped by env_reset).
+swap_to() {
+  ln -sfn "$1" "$root/.current-next"
+  if [ -n "${RUST_API_FAIL_ATOMIC_SWAP:-}" ]; then
+    rm -f "$root/.current-next"
+    fail "atomic current-symlink replacement failed (simulated); previous release left active"
+    return 1
+  fi
+  if mv -Tf "$root/.current-next" "$current" 2>/dev/null; then
+    return 0
+  fi
+  if [ -n "$test_mode" ]; then
+    swap_to_bsd_nonatomic
+    return 0
+  fi
+  rm -f "$root/.current-next"
+  fail "atomic current-symlink replacement failed; previous release left active"
+  return 1
+}
+
+# The `version` field of /health/live (the build SHA of the running
+# process), empty when the endpoint or field is unavailable. Parsed with
+# sed on purpose: the service emits a fixed two-field JSON object and the
+# VM must not need jq installed.
+serving_version() {
+  curl --fail --silent --max-time 2 "$health_base/health/live" 2>/dev/null \
+    | sed -n 's/.*"version":[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+# restart_and_await VERSION — restart, then require BOTH readiness and that
+# the serving process reports VERSION before declaring success. During
+# startup the endpoint can transiently answer with the previous process's
+# version (or no version at all); that is retried until the deadline —
+# only a version mismatch that persists to the end of the polling window
+# is the stale-binary failure.
+restart_and_await() {
+  local want="$1" attempt served=""
+  if ! $restart_cmd; then
+    fail "restart failed"
+    return 1
+  fi
+  for attempt in $(seq 1 "$ready_attempts"); do
+    if curl --fail --silent --max-time 2 "$health_base/health/ready" >/dev/null 2>&1; then
+      served="$(serving_version || true)"
+      if [ -z "$served" ]; then
+        : # ready but no version yet — retry until the deadline
+      elif [ "$served" = "$want" ]; then
+        return 0
+      fi
     fi
     sleep 1
   done
-  echo "readiness check failed" >&2
-fi
-if [[ -n "$previous" && -d "$previous" ]]; then
-  echo "rolling back to $previous" >&2
-  ln -sfn "$previous" "/opt/rust-api/.current-next"
-  mv -Tf "/opt/rust-api/.current-next" "$current"
-  systemctl restart rust-api || true
+  if [ -n "$served" ] && [ "$served" != "$want" ]; then
+    fail "serving $served, expected $want — stale binary survived the polling window (last attempt $attempt)"
+  else
+    fail "readiness check failed after ${ready_attempts}s"
+  fi
+  return 1
+}
+
+# prune_releases PREVIOUS — post-success retention. Runs only after a
+# verified-good activation and never removes current or previous; retained
+# releases are deleted here and nowhere else.
+prune_releases() {
+  local keep_previous="$1" keep_current victim
+  [ -d "$releases" ] || return 0
+  keep_current="$(readlink -f "$current" 2>/dev/null || true)"
+  # Compare by basename: release directory names are unique (40-hex), and
+  # full-path comparison breaks where the release root sits behind a
+  # resolved symlink (e.g. /var -> /private/var on macOS).
+  # mtime seconds, GNU first then BSD (dev hosts).
+  mtime_of() { stat -c '%Y' "$1" 2>/dev/null || stat -f '%m' "$1" 2>/dev/null || echo 0; }
+  for victim in "$releases"/*/; do
+    victim="${victim%/}"
+    [ "${victim##*/}" = "${keep_current##*/}" ] && continue
+    [ "${victim##*/}" = "${keep_previous##*/}" ] && continue
+    printf '%s %s\n' "$(mtime_of "$victim")" "$victim"
+  done | sort -rn | tail -n +"$((retain_extra + 1))" | while read -r _ victim; do
+    [ -n "$victim" ] || continue
+    log "retention: removing old release ${victim##*/}"
+    rm -rf -- "$victim"
+  done
+}
+
+# --- 1. artifact -------------------------------------------------------------
+release="$releases/$sha"
+source="$incoming/rust-api-${sha}"
+previous="$(readlink -f "$current" 2>/dev/null || true)"
+
+if [ -f "$source" ] && [ ! -L "$source" ]; then
+  if [ -z "$test_mode" ]; then
+    [ "$(stat -c '%U' "$source")" = "deploy" ] || { echo "unexpected upload owner" >&2; exit 3; }
+  fi
+  actual="$(sha256 "$source")"
+  [ "$actual" = "$expected" ] || { echo "checksum mismatch" >&2; exit 3; }
+  mkdir -p "$release"
+  if [ -n "$test_mode" ]; then
+    install -m 0755 "$source" "$release/rust-api"
+  else
+    install -m 0755 -o root -g root "$source" "$release/rust-api"
+  fi
+  printf '%s\n' "$expected" >"$release/.digest"
+elif [ -d "$release" ] && [ -x "$release/rust-api" ] && [ -f "$release/.digest" ]; then
+  # Re-activation of an installed release (manual rollback): the uploaded
+  # copy is gone; verify against the digest recorded at install time.
+  [ "$(cat "$release/.digest")" = "$expected" ] || {
+    echo "installed release digest does not match argument" >&2
+    exit 3
+  }
+  log "re-activating installed release $sha (no upload present)"
 else
-  echo "no previous release available" >&2
+  echo "missing regular uploaded binary" >&2
+  exit 3
 fi
-exit 1
+
+# --- 2. activate -------------------------------------------------------------
+# A failed atomic swap never touched the active symlink, so the previous
+# release is still serving: report failure and exit without restarting
+# anything. There is nothing to roll back.
+if ! swap_to "$release"; then
+  exit 1
+fi
+if ! restart_and_await "$sha"; then
+  # previous == release means the broken release was already the active
+  # one (re-activation); there is nothing to roll back to.
+  if [ -n "$previous" ] && [ -d "$previous" ] && [ "$previous" != "$release" ]; then
+    log "rolling back to ${previous##*/}"
+    if swap_to "$previous" && restart_and_await "$(basename "$previous")"; then
+      log "rollback complete; previous release verified serving"
+    else
+      fail "rollback did not restore a verified-good release — manual intervention required"
+    fi
+  else
+    fail "no previous release available for rollback"
+  fi
+  exit 1
+fi
+
+# --- 3. success bookkeeping --------------------------------------------------
+rm -f "$source"
+printf '%s activated=%s previous=%s\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%S%z)" "$sha" "${previous##*/}" >>"$history"
+prune_releases "$previous"
+log "deployed $sha"

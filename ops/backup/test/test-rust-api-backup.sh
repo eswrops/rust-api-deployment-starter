@@ -171,11 +171,14 @@ $S_OUT" || true
 }
 
 expect_deletes() {  # expect_deletes DESC EXPECTED_JSON_ARRAY_OF_LOG
-  dump="$(mock_dump)"
-  python3 - "$dump" "$2" <<-"PY"
+  # State travels via files, not argv: the dump exceeds Linux's 128 KiB
+  # per-argument limit once the pagination scenario has run.
+  mock_dump >"$temp/dump.json"
+  printf '%s' "$2" >"$temp/expected-deletes.json"
+  python3 - "$temp/dump.json" "$temp/expected-deletes.json" <<-"PY"
 	import json, sys
-	dump = json.loads(sys.argv[1])
-	expected = json.loads(sys.argv[2])
+	dump = json.loads(open(sys.argv[1]).read())
+	expected = json.loads(open(sys.argv[2]).read())
 	got = [{k: d[k] for k in ("name", "generation", "status")} for d in dump["delete_log"]]
 	assert got == expected, f"delete_log mismatch:\n got: {got}\nwant: {expected}"
 	print("ok")
@@ -360,10 +363,10 @@ run_backup
 expect_rc 1 "heartbeat_upload_failure"
 expect_contains "gcs_upload heartbeat.txt -> HTTP 500" "heartbeat_upload_failure"
 [ ! -f "$S/backups/last-backup-success" ] || die "heartbeat_upload_failure: last-backup-success written despite heartbeat failure"
-dump="$(mock_dump)"
-python3 - "$dump" <<'PY'
+mock_dump >"$temp/dump.json"
+python3 - "$temp/dump.json" <<'PY'
 import json, sys
-dump = json.loads(sys.argv[1])
+dump = json.loads(open(sys.argv[1]).read())
 snapshots = [n for n in dump["objects"] if n.startswith("snapshots/")]
 assert len(snapshots) == 1, f"expected the uploaded snapshot in the bucket, got {snapshots}"
 assert dump["delete_log"] == [], f"retention must not run after heartbeat failure: {dump['delete_log']}"
@@ -393,9 +396,10 @@ expect_deletes "superseded_versions" "$(expected_log '[
   {"name": "snapshots/app-x.db", "generation": "1", "status": 204},
   {"name": "snapshots/app-x.db", "generation": None, "status": 204}
 ]')"
-python3 - "$(mock_dump)" <<'PY'
+mock_dump >"$temp/dump.json"
+python3 - "$temp/dump.json" <<'PY'
 import json, sys
-dump = json.loads(sys.argv[1])
+dump = json.loads(open(sys.argv[1]).read())
 kept = dump["objects"]["snapshots/app-y.db"]["versions"]
 assert len(kept) == 1 and kept[0]["timeDeleted"] is None, f"recent version must be kept: {kept}"
 assert "heartbeat.txt" in dump["objects"], "heartbeat object must never be expired"
