@@ -78,8 +78,13 @@ echo "binary digest: $digest"
 step "2/6 seed database"
 if [ "$SKIP_SEED" -eq 1 ]; then
   echo "skipped (--skip-seed)"
-elif vm "test -s /var/lib/feed-api/feed.db"; then
-  echo "seed already present; skipped"
+elif [ -f "$SEED_DB" ] && vm "test -s /var/lib/feed-api/feed.db"; then
+  seed_digest="$(sha_of "$SEED_DB")"
+  echo "seed already present; verifying digest"
+  vm "set -e
+    actual=\$(sudo sha256sum /var/lib/feed-api/feed.db | awk '{print \$1}')
+    [ \"\$actual\" = '${seed_digest}' ] || { echo 'seed digest mismatch' >&2; exit 1; }
+    echo 'seed verified: sha256 match'" || fail "existing seed digest mismatch"
 else
   [ -f "$SEED_DB" ] || fail "seed database not found: $SEED_DB (pass --seed-db)"
   seed_digest="$(sha_of "$SEED_DB")"
@@ -92,7 +97,7 @@ else
     sudo mv /var/lib/feed-api/feed.db.partial /var/lib/feed-api/feed.db
     sudo chown rustapi:rustapi /var/lib/feed-api/feed.db
     sudo chmod 0640 /var/lib/feed-api/feed.db
-    actual=\$(sha256sum /var/lib/feed-api/feed.db | awk '{print \$1}')
+    actual=\$(sudo sha256sum /var/lib/feed-api/feed.db | awk '{print \$1}')
     [ \"\$actual\" = '${seed_digest}' ] || { echo 'seed digest mismatch' >&2; exit 1; }
     echo 'seed verified: sha256 match'" || fail "seed relay failed"
   gcloud storage rm "gs://${BUCKET}/imports/feed.db" >/dev/null 2>&1 || echo "warning: could not delete gs://${BUCKET}/imports/feed.db (retention will expire it)" >&2
