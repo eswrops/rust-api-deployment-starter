@@ -29,7 +29,8 @@
 #      (idempotent; never overwrites; never touches binaries or the
 #      symlink);
 #   7. re-checks service health: rust-api /health/live (200 + expected
-#      build SHA) and /health/ready (200), feed-api /health/live (200);
+#      build SHA) and /health/ready (200), feed-api /health (200, JSON
+#      "status":"ok" — feed-api implements only /health, not /health/live);
 #   8. on ANY validation failure after installation, restores the backup
 #      atomically, verifies its SHA, and exits non-zero.
 #
@@ -43,6 +44,8 @@ PROJECT="${GCP_PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || true
 ZONE="${GCE_ZONE:-us-west1-b}"
 INSTANCE="${GCE_INSTANCE:-rust-api-prod}"
 REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=ops/install-rust-api-activation-lib.sh
+. "$REPO/ops/install-rust-api-activation-lib.sh"
 
 usage() { grep '^#' "$0" | head -22; exit 2; }
 while [ $# -gt 0 ]; do
@@ -147,7 +150,7 @@ if [ "$NEEDS_INSTALL" -eq 1 ]; then
   echo "backup: $BACKUP_PATH ($(vm "sha256sum '$BACKUP_PATH' | cut -d' ' -f1"))"
   # Atomic replacement: stage inside /usr/local/sbin, then one rename. The
   # active symlink, the service and the running process are never touched.
-  vm "sudo install -m 0755 -o root -g root '$REMOTE_STAGE' /usr/local/sbin/.rust-api-activate.new \
+  vm "sudo install -m 0755 -o root -g root \$HOME/$REMOTE_STAGE /usr/local/sbin/.rust-api-activate.new \
         && sudo mv -Tf /usr/local/sbin/.rust-api-activate.new /usr/local/sbin/rust-api-activate" \
     || fail "atomic installation failed (installed script untouched; remove ~/$REMOTE_STAGE)"
 fi
@@ -193,15 +196,19 @@ vm "test \"\$(sha256sum \$HOME/$REMOTE_BACKFILL | cut -d' ' -f1)\" = '$(sha_loca
   || fail "staged backfill tool digest mismatch on VM"
 vm "sudo install -m 0755 -o root -g root \$HOME/$REMOTE_BACKFILL /usr/local/sbin/rust-api-backfill-digests && rm -f \$HOME/$REMOTE_BACKFILL"
 echo "--- backfill dry run ---"
-DRYRUN_TAIL="$(vm 'sudo /usr/local/sbin/rust-api-backfill-digests | tail -n 1')" \
-  || { restore_backup; fail "backfill dry run reported problems — nothing backfilled"; }
-echo "$DRYRUN_TAIL"
-# The summary always ends "..., N already correct, K refused". Any refusal is
-# a stop condition the operator must resolve manually; the backfill tool
-# itself never overwrites, so nothing was written either way.
-if grep -qE ', [1-9][0-9]* refused$' <<<"$DRYRUN_TAIL"; then
+# The dry-run output is captured COMPLETE (stdout+stderr) and the remote exit
+# code is preserved — piping into tail here would let tail's status mask the
+# tool's. Apply proceeds only if the preflight check passes all four gates:
+# exit 0, well-formed summary, zero refused, no FAIL diagnostics.
+set +e
+DRYRUN_OUT="$(vm 'sudo /usr/local/sbin/rust-api-backfill-digests' 2>&1)"
+DRYRUN_RC=$?
+set -e
+printf '%s\n' "$DRYRUN_OUT"
+printf '%s\n' "$DRYRUN_OUT" >"$TMP/backfill-dryrun.out"
+if ! REASON="$(backfill_preflight_check "$DRYRUN_RC" "$TMP/backfill-dryrun.out")"; then
   restore_backup
-  fail "backfill dry run reports refusals; resolve them manually before applying"
+  fail "backfill dry run rejected: $REASON"
 fi
 echo "--- backfill apply ---"
 vm 'sudo /usr/local/sbin/rust-api-backfill-digests --apply' \
@@ -217,8 +224,12 @@ curl --fail --silent --max-time 5 http://127.0.0.1:8080/health/live | grep -q "$
 curl --fail --silent --max-time 5 http://127.0.0.1:8080/health/ready >/dev/null || { echo "ready not 200"; exit 1; }
 echo "rust-api live+ready OK ($current)"
 if systemctl is-active --quiet feed-api; then
-  curl --fail --silent --max-time 5 http://127.0.0.1:8081/health/live >/dev/null
-  echo "feed-api live OK"
+  # feed-api implements ONLY /health (JSON: status/db/uptime_s); probing
+  # /health/live there would 404. Require 200 + status ok.
+  feed_health="$(curl --fail --silent --max-time 5 http://127.0.0.1:8081/health)"
+  printf '%s\n' "$feed_health" | grep -q '"status":"ok"' \
+    || { echo "feed-api /health returned unexpected body: $feed_health"; exit 1; }
+  echo "feed-api /health OK"
 else
   echo "feed-api not installed (skipped)"
 fi
