@@ -1,0 +1,33 @@
+name: Feed API release build
+# Builds the benchmark feed-api as a Linux AMD64 release binary and uploads
+# it as an artifact for the operator installer (ops/install-feed-api.sh).
+# Dispatch-only: this workflow has no deploy credentials and never touches
+# production.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  RUST_VERSION: "1.99.1"
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup toolchain install "$RUST_VERSION" --profile minimal
+      - name: Build Linux AMD64 release
+        working-directory: benchmark/feed-api
+        run: cargo build --release --locked
+      - name: Package artifact
+        run: |
+          cp benchmark/feed-api/target/release/feed-api feed-api
+          sha256sum feed-api > feed-api.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: feed-api-linux-amd64
+          path: |
+            feed-api
+            feed-api.sha256
+          if-no-files-found: error
+          retention-days: 7
