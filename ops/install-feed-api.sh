@@ -106,7 +106,7 @@ fi
 # 3/6 Binary + env file.
 step "3/6 install binary and environment"
 vm "set -e
-  sudo install -d -m 0755 -o root -g root /opt/feed-api/releases '${release%/*}'
+  sudo install -d -m 0755 -o root -g root /opt/feed-api /opt/feed-api/releases '${release}'
   sudo install -m 0755 -o root -g root '/home/$(whoami)/feed-api-${GIT_SHA}' '${release}/feed-api'
   actual=\$(sha256sum '${release}/feed-api' | awk '{print \$1}')
   [ \"\$actual\" = '${digest}' ] || { echo 'binary digest mismatch' >&2; exit 1; }
