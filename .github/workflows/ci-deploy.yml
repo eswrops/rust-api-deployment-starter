@@ -87,6 +87,9 @@ jobs:
           bash ops/backup/test/test-rust-api-backup.sh
           bash ops/backup/test/test-backup-freshness-check.sh
           bash ops/test/test-rust-api-activate.sh
+          bash ops/test/test-backfill-release-digests.sh
+          bash .github/scripts/test-deploy-changes.sh
+          bash .github/scripts/test-deploy-still-current.sh
 
   benchmark:
     # Pull requests always run the full suite (regression gate). Pushes to
@@ -189,24 +192,8 @@ jobs:
         run: |
           cp target/release/rust-api rust-api
           sha256sum rust-api > rust-api.sha256
-      - name: Smoke test the built binary
-        run: |
-          set -Eeuo pipefail
-          smoke_dir="$(mktemp -d)"
-          APP_BIND="127.0.0.1:18080" DATABASE_URL="sqlite://${smoke_dir}/smoke.db?mode=rwc" \
-            ./rust-api &
-          api_pid=$!
-          trap 'kill "$api_pid" 2>/dev/null || true' EXIT
-          for _ in $(seq 1 20); do
-            if curl --fail --silent "http://127.0.0.1:18080/health/live" >/dev/null 2>&1; then
-              echo "smoke ok: binary serves /health/live"
-              exit 0
-            fi
-            kill -0 "$api_pid" 2>/dev/null || { echo "binary exited during smoke test" >&2; exit 1; }
-            sleep 0.5
-          done
-          echo "binary did not serve /health/live within 10 s" >&2
-          exit 1
+      - name: Smoke test the built binary (migrations, live+ready, graceful SIGTERM)
+        run: bash .github/scripts/release-smoke.sh ./rust-api "$GITHUB_SHA"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rust-api-linux-amd64
@@ -252,14 +239,18 @@ jobs:
           fetch-depth: 1
       - name: Verify this run is still the tip of main
         id: tip
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
         run: |
-          tip="$(git ls-remote origin refs/heads/main | awk '{print $1}')"
-          echo "tip of main: $tip"
-          echo "this run:    $GITHUB_SHA"
-          if [ "$tip" = "$GITHUB_SHA" ]; then
+          set -Eeuo pipefail
+          echo "this run: $GITHUB_SHA"
+          rc=0
+          tip="$(bash .github/scripts/deploy-still-current.sh)" || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "tip of main: $tip (current)"
             echo "is_tip=true" >>"$GITHUB_OUTPUT"
-          else
-            echo "is_tip=false" >>"$GITHUB_OUTPUT"
+          elif [ "$rc" -eq 1 ]; then
+            # Superseded: main has moved on and its own run owns production.
             echo "::notice::Superseded: main has advanced to ${tip}; skipping deployment of ${GITHUB_SHA}"
             {
               echo "### Deployment skipped: superseded"
@@ -267,6 +258,12 @@ jobs:
               echo "main is at \`${tip}\`; this run built \`${GITHUB_SHA}\`, which is no"
               echo "longer the tip. The newer commit's run owns the production deployment."
             } >>"$GITHUB_STEP_SUMMARY"
+            echo "is_tip=false" >>"$GITHUB_OUTPUT"
+          else
+            # Exit 2: the tip could not be verified. Fail closed — a
+            # deployment that cannot prove it is current must not proceed.
+            echo "could not verify the tip of main (deploy-still-current exit $rc); failing closed" >&2
+            exit 1
           fi
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         if: steps.tip.outputs.is_tip == 'true'
@@ -373,10 +370,13 @@ jobs:
           # Last stale-commit guard: if another push landed on main while
           # this run was building and connecting, its deploy owns production;
           # activating this artifact would regress it. Failing loudly here is
-          # deliberate — we are seconds from activation.
-          latest_tip="$(git ls-remote origin refs/heads/main | awk '{print $1}')"
-          if [ "$latest_tip" != "$GITHUB_SHA" ]; then
-            echo "superseded mid-flight: main advanced to ${latest_tip}; refusing to activate ${GITHUB_SHA}" >&2
+          # deliberate — we are seconds from activation. (Exit 2 from the
+          # check — unverifiable — fails the job the same way: never activate
+          # an artifact whose currency could not be proven.)
+          rc=0
+          latest_tip="$(bash .github/scripts/deploy-still-current.sh)" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "superseded or unverifiable (exit $rc): main is at ${latest_tip:-<unknown>}; refusing to activate ${GITHUB_SHA}" >&2
             exit 1
           fi
           destination="deploy@127.0.0.1:/home/deploy/incoming/rust-api-${GITHUB_SHA}"

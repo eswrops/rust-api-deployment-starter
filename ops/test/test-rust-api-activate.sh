@@ -6,7 +6,10 @@
 # Covers the happy path, argument and digest validation, broken-release
 # rollback (including verification of the rollback itself), double failure,
 # concurrent-activation refusal, manual rollback via the installed release,
-# stale-binary detection through the /health/live version, and retention.
+# stale-binary detection through the /health/live version, retention, the
+# failed-atomic-rename path (previous release must stay active, nothing
+# restarted), and a static guard keeping the non-atomic BSD swap shim inside
+# the test-mode branch only.
 # Nothing touches systemd, the VM, or production.
 set -Eeuo pipefail
 repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -43,6 +46,7 @@ fresh_env() {
 
 start_server() {
   [ -n "$server_pid" ] && kill "$server_pid" 2>/dev/null || true
+  rm -f "$temp/port" # otherwise the stale port of the previous mock is read
   python3 "$temp/mock-activate-service.py" "$temp" &
   server_pid=$!
   for _ in $(seq 1 50); do
@@ -137,6 +141,13 @@ run_activate() {
 upload() { # upload SHA — fake artifact in incoming/
   local sha="$1"
   printf '#!/bin/sh\n# rust-api %s\nwhile :; do sleep 3600; done\n' "$sha" >"$temp/incoming/rust-api-$sha"
+}
+
+mkrel() { # mkrel SHA — installed release (binary + .digest), not activated
+  mkdir -p "$temp/root/releases/$1"
+  printf '#!/bin/sh\n# %s\n' "$1" >"$temp/root/releases/$1/rust-api"
+  chmod 0755 "$temp/root/releases/$1/rust-api"
+  printf '%s\n' "$(digest_of "$temp/root/releases/$1/rust-api")" >"$temp/root/releases/$1/.digest"
 }
 
 current_sha() { basename "$(readlink "$temp/root/current")"; }
@@ -276,5 +287,45 @@ for s in "$AGED1" "$AGED2" "$AGED3" "$AGED4" "$AGED5" "$AGED6" "$AGED7"; do
 done
 grep -q "retention: removing" <<<"$out" || die "retention not logged: $out"
 pass "retention keeps current + previous + 3 newest, logs removals"
+
+# --- 11. failed atomic rename: previous release stays active and serving ------
+# Production must never fall back to rm+mv of the active symlink. The test
+# hook RUST_API_FAIL_ATOMIC_SWAP makes the rename fail (as a real EBUSY or
+# cross-device rename would on the VM); activation must fail non-zero with
+# the previous release still live and nothing restarted.
+fresh_env
+start_server
+mkrel "$PREV"
+ln -sfn "$temp/root/releases/$PREV" "$temp/root/current"
+echo "$PREV" >"$temp/ctrl/serve_sha"
+echo 1 >"$temp/ctrl/ready"
+upload "$NEW"
+ND2="$(digest_of "$temp/incoming/rust-api-$NEW")"
+restarts_before="$(wc -l <"$temp/ctrl/restarts" | tr -d ' ')"
+RUST_API_FAIL_ATOMIC_SWAP=1 run_activate 3 "$NEW" "$ND2"
+[ "$rc" -eq 1 ] || die "failed atomic rename must fail activation (rc=$rc): $out"
+grep -q "atomic current-symlink replacement failed" <<<"$out" || die "no atomic-failure message: $out"
+[ "$(current_sha)" = "$PREV" ] || die "current changed by failed rename: $(current_sha)"
+curl -fsS "http://127.0.0.1:${port}/health/live" | grep -q "$PREV" || die "previous release not still serving"
+[ "$(wc -l <"$temp/ctrl/restarts" | tr -d ' ')" = "$restarts_before" ] || die "service was restarted despite the swap failing"
+[ -e "$temp/incoming/rust-api-$NEW" ] || die "upload must be kept on swap failure"
+[ -e "$temp/root/releases/$NEW/rust-api" ] || die "validated artifact should still be installed pre-swap"
+[ ! -e "$temp/root/.current-next" ] || die "staging symlink not cleaned up after failed rename"
+pass "failed atomic rename: previous release untouched, activation failed, no restart"
+
+# --- 12. production atomicity guard (static) ----------------------------------
+# The non-atomic rm+mv of the active symlink must exist ONLY inside the
+# test-only BSD shim, and its single call site must be test-mode guarded.
+# shellcheck disable=SC2016  # the grep pattern is intentionally a literal
+[ "$(grep -c 'rm -f "$current"' "$activate")" -eq 1 ] \
+  || die "non-atomic removal of the active symlink appears more than once"
+grep -q 'swap_to_bsd_nonatomic()' "$activate" || die "BSD shim function missing"
+call_lines="$(grep -n 'swap_to_bsd_nonatomic' "$activate" | grep -v '()' \
+  | awk -F: '$2 !~ /^[[:space:]]*#/ {print $1}')"
+[ "$(printf '%s\n' "$call_lines" | wc -l | tr -d ' ')" -eq 1 ] || die "BSD shim call sites: $call_lines"
+call_line="$(printf '%s\n' "$call_lines")"
+prev_line="$(sed -n "$((call_line - 1))p" "$activate")"
+grep -q 'test_mode' <<<"$prev_line" || die "BSD fallback call is not test-mode guarded: $prev_line"
+pass "static guard: non-atomic fallback exists only under the test-mode branch"
 
 echo "all rust-api-activate tests passed"

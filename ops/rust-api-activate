@@ -7,8 +7,10 @@
 #      regular file, digest);
 #   2. take the activation lock (a concurrent activation is REFUSED, not
 #      queued — the losing deploy must fail loudly, not stack silently);
-#   3. install into /opt/rust-api/releases/<sha>/ and atomically swap the
-#      `current` symlink;
+#   3. install into /opt/rust-api/releases/<sha>/ and atomically replace the
+#      `current` symlink (single GNU mv -T rename on the VM); if that atomic
+#      replacement fails, the previous release stays active and untouched
+#      and the activation fails — the active symlink is never deleted;
 #   4. restart the service and poll readiness, then verify the RUNNING
 #      process actually serves the new release (/health/live reports the
 #      build SHA as `version`) — a restart that left the old binary up is
@@ -38,6 +40,8 @@
 #   RUST_API_HEALTH_BASE   [http://127.0.0.1:8080]
 #   RUST_API_READY_ATTEMPTS[20] — 1 s apart
 #   RUST_API_RETAIN_EXTRA  [3] — releases kept besides current + previous
+#   RUST_API_FAIL_ATOMIC_SWAP [unset] — make the symlink rename fail on
+#     purpose (regression tests for the failed-atomic-rename path)
 set -Eeuo pipefail
 test_mode="${RUST_API_TEST_MODE:-}"
 
@@ -104,16 +108,40 @@ acquire_lock
 
 # --- helpers -----------------------------------------------------------------
 
-# Atomic current-symlink swap. mv -T is the GNU rename(2) atomic path used
-# on the VM; BSD mv (macOS dev/test) lacks -T, so fall back to the
-# non-atomic rm+mv there — tests do not depend on atomicity.
+# Test-only portability shim for BSD mv (macOS dev/test hosts): BSD mv has
+# no -T, so the swap cannot be a single rename there. This DELETES the
+# active symlink before recreating it and is therefore never acceptable on
+# production Linux. Reachable only under RUST_API_TEST_MODE, which sudoers
+# env_reset strips on the VM.
+swap_to_bsd_nonatomic() {
+  rm -f "$current"
+  mv "$root/.current-next" "$current"
+}
+
+# Atomic current-symlink replacement. On the VM this MUST be the single GNU
+# rename(2) that `mv -T` performs: the active symlink is replaced in place
+# and never passes through a state where it does not exist. If the atomic
+# rename fails (EBUSY, cross-device, permissions...), the previous release
+# is left active and untouched, and the failure propagates — there is no
+# rm-then-mv fallback on production. RUST_API_FAIL_ATOMIC_SWAP is a test
+# hook that makes the rename fail on purpose (also stripped by env_reset).
 swap_to() {
   ln -sfn "$1" "$root/.current-next"
+  if [ -n "${RUST_API_FAIL_ATOMIC_SWAP:-}" ]; then
+    rm -f "$root/.current-next"
+    fail "atomic current-symlink replacement failed (simulated); previous release left active"
+    return 1
+  fi
   if mv -Tf "$root/.current-next" "$current" 2>/dev/null; then
     return 0
   fi
-  rm -f "$current"
-  mv "$root/.current-next" "$current"
+  if [ -n "$test_mode" ]; then
+    swap_to_bsd_nonatomic
+    return 0
+  fi
+  rm -f "$root/.current-next"
+  fail "atomic current-symlink replacement failed; previous release left active"
+  return 1
 }
 
 # The `version` field of /health/live (the build SHA of the running
@@ -126,9 +154,13 @@ serving_version() {
 }
 
 # restart_and_await VERSION — restart, then require BOTH readiness and that
-# the serving process reports VERSION before declaring success.
+# the serving process reports VERSION before declaring success. During
+# startup the endpoint can transiently answer with the previous process's
+# version (or no version at all); that is retried until the deadline —
+# only a version mismatch that persists to the end of the polling window
+# is the stale-binary failure.
 restart_and_await() {
-  local want="$1" attempt served
+  local want="$1" attempt served=""
   if ! $restart_cmd; then
     fail "restart failed"
     return 1
@@ -137,18 +169,18 @@ restart_and_await() {
     if curl --fail --silent --max-time 2 "$health_base/health/ready" >/dev/null 2>&1; then
       served="$(serving_version || true)"
       if [ -z "$served" ]; then
-        fail "ready but /health/live reported no version (attempt $attempt)"
-        return 1
+        : # ready but no version yet — retry until the deadline
+      elif [ "$served" = "$want" ]; then
+        return 0
       fi
-      if [ "$served" != "$want" ]; then
-        fail "serving $served, expected $want — restart picked up a stale binary (attempt $attempt)"
-        return 1
-      fi
-      return 0
     fi
     sleep 1
   done
-  fail "readiness check failed after ${ready_attempts}s"
+  if [ -n "$served" ] && [ "$served" != "$want" ]; then
+    fail "serving $served, expected $want — stale binary survived the polling window (last attempt $attempt)"
+  else
+    fail "readiness check failed after ${ready_attempts}s"
+  fi
   return 1
 }
 
@@ -208,17 +240,21 @@ else
 fi
 
 # --- 2. activate -------------------------------------------------------------
-swap_to "$release"
+# A failed atomic swap never touched the active symlink, so the previous
+# release is still serving: report failure and exit without restarting
+# anything. There is nothing to roll back.
+if ! swap_to "$release"; then
+  exit 1
+fi
 if ! restart_and_await "$sha"; then
   # previous == release means the broken release was already the active
   # one (re-activation); there is nothing to roll back to.
   if [ -n "$previous" ] && [ -d "$previous" ] && [ "$previous" != "$release" ]; then
     log "rolling back to ${previous##*/}"
-    swap_to "$previous"
-    if restart_and_await "$(basename "$previous")"; then
+    if swap_to "$previous" && restart_and_await "$(basename "$previous")"; then
       log "rollback complete; previous release verified serving"
     else
-      fail "rollback did not reach readiness — manual intervention required"
+      fail "rollback did not restore a verified-good release — manual intervention required"
     fi
   else
     fail "no previous release available for rollback"

@@ -81,6 +81,17 @@ the script reports success):
   `sudo /usr/local/sbin/rust-api-activate <previous-sha> <previous-digest>` or
   rely on the automatic rollback that `rust-api-activate` performs when a new
   release fails its readiness probe.
+- **Digest metadata:** re-activating an installed release verifies the
+  `.digest` recorded in the release directory. Releases installed before
+  digests were recorded (the activation script did not always write
+  `.digest`) are not usable as rollback targets until backfilled:
+  `sudo /usr/local/sbin/rust-api-backfill-digests` (dry run — always run it
+  first) then `... --apply`. The tool is idempotent, computes the SHA-256
+  from the installed binary, records it atomically, never overwrites a
+  mismatched existing digest, never modifies binaries and never touches the
+  `current` symlink. Note that hashing an old installed binary establishes
+  what its contents are now; it does not independently re-establish the
+  provenance of the build that produced it.
 - **Schema note:** binary rollback never reverts schema. Migration `0001_init`
   is purely additive (`CREATE TABLE`/`CREATE INDEX` only) and the previous
   production binary contains no SQLite code at all, so the old binary is fully
