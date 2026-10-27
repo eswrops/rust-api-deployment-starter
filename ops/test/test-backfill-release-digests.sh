@@ -134,7 +134,10 @@ pass "invalid, non-executable, missing and symlinked entries refused fail-visibl
 LOCKED="$(sha_of g)"
 mk_old_release "$LOCKED"
 if command -v flock >/dev/null 2>&1; then
-  flock "$temp/lock" -c 'sleep 4' &
+  # Hold the lock in a wrapper whose child closes the lock fd: killing the
+  # wrapper must release the lock immediately (flock -c would leave the
+  # child sleep holding the inherited fd for its whole runtime).
+  LOCKHOLDER_LOCK="$temp/lock" bash -c 'exec 9>"$LOCKHOLDER_LOCK"; flock 9; sleep 4 9>&-' &
   lock_pid=$!
   sleep 0.3
   run_backfill --apply
