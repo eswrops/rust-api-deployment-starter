@@ -1,23 +1,18 @@
 api-bench.thetechs.top {
     encode zstd gzip
 
-    # Feed API (SPEC.md, benchmark/feed-api) on 127.0.0.1:8081: the spec's
-    # endpoints. Exact /health is the feed API's health; /health/live and
-    # /health/ready (production rust-api) keep falling through to the
-    # default handler below.
-    handle /health {
-        reverse_proxy 127.0.0.1:8081
+    # Production rust-api keeps its two health endpoints on 127.0.0.1:8080.
+    handle /health/live {
+        reverse_proxy 127.0.0.1:8080
     }
-    handle /feed* {
-        reverse_proxy 127.0.0.1:8081
-    }
-    handle /posts* {
-        reverse_proxy 127.0.0.1:8081
+    handle /health/ready {
+        reverse_proxy 127.0.0.1:8080
     }
 
-    # Production rust-api on 127.0.0.1:8080: everything else, including
-    # /health/live and /health/ready.
+    # The SPEC.md feed API (benchmark/feed-api) on 127.0.0.1:8081 is the
+    # site default: /health, /feed, /posts*, and spec-mandated JSON 404s
+    # ({"error":"not found"}) for unknown paths.
     handle {
-        reverse_proxy 127.0.0.1:8080
+        reverse_proxy 127.0.0.1:8081
     }
 }
